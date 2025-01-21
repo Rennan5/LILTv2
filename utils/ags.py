@@ -84,4 +84,10 @@ def ags_algorithm(boxes):
     sorted_boxes = [boxes[Sy[i]] for i in range(Nb)] # possivel erro (linha 18)
     
     return sorted_boxes
-        
+
+if __name__ == '__main__':
+    # (x1, y1, x2, y2, x3, y3, x4, y4)
+    original_ocr = [[0, 0, 10, 0, 10, 5, 0, 5], [0, 0, 10, 0, 5, 10, 0, 5]]
+    original_ocr = convert_ocr_format(original_ocr)
+    print('formato convertido: (x1, y1, x2, y2, w, h)')
+    print(original_ocr)
