@@ -5,11 +5,7 @@ import os
 import numpy as np
 
 from utils.dataset import load_cord_dataset, load_custom_dataset, load_mixed_dataset
-from utils.lambert.model import LambertModel
-from utils.layoutlm.model import LayoutLMModel
-from utils.layoutlmv2.model import LayoutLMv2Model
-from utils.layoutlmv3.model import LayoutLMv3Model
-from utils.lilt.model import LiltModel
+from utils.liltv2.model import LiltModel
 from utils.save import save_metrics, save_results
 
 
@@ -112,18 +108,8 @@ if __name__ == '__main__':
 
     # Training
     model_type = args.model_type.upper()
-    if model_type == 'LILT':
+    if model_type == 'LILTV2':
         model = LiltModel(repository_id, labels)
-    elif model_type == 'LAYOUTLMV3':
-        model = LayoutLMv3Model(repository_id, labels)
-    elif model_type == 'LAMBERT_ROBERTA':
-        model = LambertModel(repository_id, labels, 'ROBERTA')
-    elif model_type == 'LAMBERT_BERTIMBAU':
-        model = LambertModel(repository_id, labels, 'BERTIMBAU')
-    elif model_type == 'LAYOUTLM':
-        model = LayoutLMModel(repository_id, labels)
-    elif model_type == 'LAYOUTLMV2':
-        model = LayoutLMv2Model(repository_id, labels)
     else:
         raise Exception
 

@@ -58,7 +58,7 @@ def ags_algorithm(boxes):
     cy_ids = []
     
     # lines 4 to 11 from the article
-    for j in range( 1, Nb - 1):
+    for j in range(1, Nb - 1):
         if cy[Sy[j]] - cy[Sy[j - 1]] < sig: cy_ids.append(id)
         else:
             id = id + 1
@@ -91,3 +91,7 @@ if __name__ == '__main__':
     original_ocr = convert_ocr_format(original_ocr)
     print('formato convertido: (x1, y1, x2, y2, w, h)')
     print(original_ocr)
+    
+    sorted_ocr = ags_algorithm(original_ocr)
+    print('formato aranjado:\n')
+    print(sorted_ocr)
