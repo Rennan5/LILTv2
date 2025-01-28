@@ -87,11 +87,14 @@ def ags_algorithm(boxes):
 
 if __name__ == '__main__':
     # (x1, y1, x2, y2, x3, y3, x4, y4)
-    original_ocr = [[0, 0, 10, 0, 10, 5, 0, 5], [0, 0, 10, 0, 5, 10, 0, 5]]
+    original_ocr = [[0, 0, 10, 0, 10, 5, 0, 5], [0, 0, 10, 0, 5, 10, 0, 5], [0, 0, 10, 0, 5, 10, 0, 5], [10, 0, 20, 0, 20, 10, 10, 10]]
+    print('formato original: (x1, y1, x2, y2, x3, y3, x4, y4)')
+    print(original_ocr)
+    
     original_ocr = convert_ocr_format(original_ocr)
     print('formato convertido: (x1, y1, x2, y2, w, h)')
     print(original_ocr)
     
     sorted_ocr = ags_algorithm(original_ocr)
-    print('formato aranjado:\n')
+    print('formato aranjado:')
     print(sorted_ocr)
