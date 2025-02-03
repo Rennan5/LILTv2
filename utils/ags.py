@@ -1,25 +1,23 @@
-def convert_ocr_format(boxes):
+def convert_ocr_format(box):
     '''
-    Converts the boxes in (x1, y1, x2, y2, x3, y3, x4, y4) format to (x1, y1, x2, y2, w, h) format (Util algorithm)
+    Converts the box in (x1, y1, x2, y2, x3, y3, x4, y4) format to (x1, y1, x2, y2, w, h) format (Util algorithm)
     
     Args:
-        boxes (list): list of boxes in (x1, y1, x2, y2, x3, y3, x4, y4) format
+        box (list): list of coordinates in (x1, y1, x2, y2, x3, y3, x4, y4) format
     
     Returns:
-        conv_boxes (list): list of boxes in (x1, y1, x2, y2, w, h) format
+        conv_box (list): list of coordinates in (x1, y1, x2, y2, w, h) format
     '''
     
-    conv_boxes = []
-    for box in boxes:
-        x1 = min(box[0], box[2], box[4], box[6])
-        y1 = min(box[1], box[3], box[5], box[7])
-        x2 = max(box[0], box[2], box[4], box[6])
-        y2 = max(box[1], box[3], box[5], box[7])
-        w = x2 - x1
-        h = y2 - y1
-        conv_boxes.append([x1, y1, x2, y2, w, h])
+    x1 = min(box[0], box[2], box[4], box[6])
+    y1 = min(box[1], box[3], box[5], box[7])
+    x2 = max(box[0], box[2], box[4], box[6])
+    y2 = max(box[1], box[3], box[5], box[7])
+    w = x2 - x1
+    h = y2 - y1
+    conv_box = [x1, y1, x2, y2, w, h]
         
-    return conv_boxes
+    return conv_box
 
 
 def ags_algorithm(boxes):
