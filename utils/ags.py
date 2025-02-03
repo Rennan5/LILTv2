@@ -61,14 +61,14 @@ def ags_algorithm(boxes):
         else:
             id = id + 1
             cy_ids.append(id)
-    
-    # lines 12 to 17 from the article
+    print((cy_ids))
+    # lines 12 to 17 from the article ***TRECHO COM ERRO***
     for j in range(0, max(cy_ids)):
-        for i in len(cy_ids):
+        for i in range(len(cy_ids)):
             if cy_ids[i] == j:
                 start = i
                 break
-        for i in range(len(cy_ids), -1, -1):
+        for i in range(max(cy_ids), -1, -1):
             if cy_ids[i] == j:
                 end = i
                 break
