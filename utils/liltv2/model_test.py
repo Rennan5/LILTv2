@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoModel
 
 class LILTv2(nn.Module):
     def __init__(self, base_model_name="bert-base-uncased", num_tasks=3, task_heads=None):
@@ -51,25 +51,58 @@ class LILTv2(nn.Module):
         output = self.task_heads[task_id](pooled_output)
         return output
 
-# Example usage
-if __name__ == "__main__":
-    tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+    def train_step(self, input_ids, attention_mask, labels, task_id, optimizer, loss_fn):
+        """
+        Perform a single training step with backpropagation.
 
-    # Define task configurations
-    tasks = [
-        {'type': 'classification', 'output_size': 3},  # e.g., sentiment analysis
-        {'type': 'classification', 'output_size': 2},  # e.g., binary classification
-        {'type': 'regression', 'output_size': 1}       # e.g., score prediction
-    ]
+        Args:
+            input_ids (torch.Tensor): Input token IDs.
+            attention_mask (torch.Tensor): Attention mask.
+            labels (torch.Tensor): Ground truth labels.
+            task_id (int): Index of the task to process.
+            optimizer (torch.optim.Optimizer): Optimizer for training.
+            loss_fn (callable): Loss function.
 
-    model = LILTv2(base_model_name="bert-base-uncased", num_tasks=3, task_heads=tasks)
+        Returns:
+            float: Computed loss value.
+        """
+        optimizer.zero_grad()
+        outputs = self.forward(input_ids, attention_mask, task_id)
+        loss = loss_fn(outputs, labels)
+        loss.backward()
+        optimizer.step()
+        return loss.item()
 
-    # Sample input
-    text = "This is a sample input for the model."
-    inputs = tokenizer(text, return_tensors="pt", padding=True, truncation=True)
+    def dual_stream_pretrain(self, text_inputs, visual_inputs, attention_mask, optimizer, loss_fn):
+        """
+        Dual-Stream Transformer Architecture for dataset pretraining.
 
-    # Forward pass for task 0
-    task_id = 0
-    outputs = model(input_ids=inputs["input_ids"], attention_mask=inputs["attention_mask"], task_id=task_id)
+        Args:
+            text_inputs (torch.Tensor): Input token IDs for text.
+            visual_inputs (torch.Tensor): Input tensor for visual data.
+            attention_mask (torch.Tensor): Attention mask for text inputs.
+            optimizer (torch.optim.Optimizer): Optimizer for training.
+            loss_fn (callable): Loss function.
 
-    print("Output shape:", outputs.shape)
+        Returns:
+            float: Computed loss value for the pretraining step.
+        """
+        optimizer.zero_grad()
+        
+        # Encode text
+        text_outputs = self.encoder(input_ids=text_inputs, attention_mask=attention_mask)
+        text_hidden = text_outputs.last_hidden_state[:, 0]  # Use [CLS] token representation
+        
+        # Encode visual data (Placeholder: Replace with actual visual encoder)
+        visual_hidden = torch.nn.Linear(visual_inputs.shape[-1], self.encoder.config.hidden_size)(visual_inputs)
+        
+        # Fusion of both modalities
+        fused_representation = torch.cat((text_hidden, visual_hidden), dim=-1)
+        fused_representation = torch.nn.Linear(fused_representation.shape[-1], self.encoder.config.hidden_size)(fused_representation)
+        
+        # Compute loss
+        loss = loss_fn(fused_representation, text_hidden)  # Example loss function
+        loss.backward()
+        optimizer.step()
+        
+        return loss.item()
