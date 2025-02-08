@@ -31,22 +31,23 @@ def list_files(dir: str) -> list:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", type=str, default=None)
-    args = parser.parse_args()
-
     parser.add_argument('--output-path', type=str, default='outputs/')
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--batch-size', type=int, default=12)
     parser.add_argument('--learning-rate', type=float, default=5e-5)
     parser.add_argument('--patience', type=int, default=None)
+    args = parser.parse_args()
 
-    dataset_path = args.dataset
-    dataset_path = f'datasets/{dataset_path}'
+    dataset_path = f'datasets/{args.dataset}'
+    epochs = args.epochs
+    batch_size = args.batch_size
+    learning_rate = args.learning_rate
 
     train = txt_to_json(f'{dataset_path}/train.txt')
     val = txt_to_json(f'{dataset_path}/val.txt')
     test = txt_to_json(f'{dataset_path}/test.txt')
     
-    model = LILTv2()
+    model = LILTv2(num_tasks=2, epochs=epochs, batch_size=batch_size, learning_rate=learning_rate)
 
     # dataset = load_mixed_dataset(load_image=False, smoke_test=False, bbox_scale=1, train=train, dev=val, test=test)
     
@@ -57,5 +58,4 @@ if __name__ == "__main__":
 
     boxes = sort_boxes(boxes)
 
-    print('converted dataset: (x1, y1, x2, y2, w, h)')
-    print(val[0]['annotations'][0]['box'])
+    print(model)

@@ -3,7 +3,7 @@ import torch.nn as nn
 from transformers import AutoModel
 
 class LILTv2(nn.Module):
-    def __init__(self, base_model_name="bert-base-uncased", num_tasks=3, task_heads=None):
+    def __init__(self, base_model_name="bert-base-uncased", epochs=10, batch_size=32, learning_rate=5e-5, num_tasks=None, task_heads=None):
         """
         Initialize the LILTv2 model.
 
@@ -16,10 +16,21 @@ class LILTv2(nn.Module):
         """
         super(LILTv2, self).__init__()
         self.encoder = AutoModel.from_pretrained(base_model_name)
-
+        self.task_heads = task_heads
+        self.epochs = epochs
+        self.batch_size = batch_size
+        self.learning_rate = learning_rate
+        self.heads = []
+        
+        if num_tasks is not None:
+            self.task_heads = []
+            for _ in range(num_tasks):
+                self.task_heads.append({'type': 'classification', 'output_size': 2})
+        
         # Initialize task-specific heads
-        self.task_heads = nn.ModuleList()
-        for i, task in enumerate(task_heads):
+        #self.task_heads = nn.ModuleList()
+        for task in self.task_heads:
+            if type(task) is not dict: break
             if task['type'] == 'classification':
                 head = nn.Sequential(
                     nn.Linear(self.encoder.config.hidden_size, task['output_size']),
@@ -29,7 +40,13 @@ class LILTv2(nn.Module):
                 head = nn.Linear(self.encoder.config.hidden_size, task['output_size'])
             else:
                 raise ValueError(f"Unsupported task type: {task['type']}")
-            self.task_heads.append(head)
+            self.heads.append(head)
+
+    def __str__(self):
+        res = f'num of tasks: {len(self.task_heads)}\n'
+        for task_head in self.task_heads:
+            res += f'{task_head['type']}\n'
+        return res
 
     def forward(self, input_ids, attention_mask, task_id):
         """
@@ -87,22 +104,39 @@ class LILTv2(nn.Module):
         Returns:
             float: Computed loss value for the pretraining step.
         """
-        optimizer.zero_grad()
+        num_epochs = self.epochs
+        batch_size = self.batch_size
+        learning_rate = self.learning_rate
         
-        # Encode text
-        text_outputs = self.encoder(input_ids=text_inputs, attention_mask=attention_mask)
-        text_hidden = text_outputs.last_hidden_state[:, 0]  # Use [CLS] token representation
+        optimizer.param_groups[0]['lr'] = learning_rate
+        dataset_size = text_inputs.shape[0]
+        for epoch in range(num_epochs):
+            epoch_loss = 0.0
+            for i in range(0, dataset_size, batch_size):
+                batch_text = text_inputs[i:i+batch_size]
+                batch_visual = visual_inputs[i:i+batch_size]
+                batch_attention = attention_mask[i:i+batch_size]
+                
+                optimizer.zero_grad()
+                
+                # Encode text
+                text_outputs = self.encoder(input_ids=batch_text, attention_mask=batch_attention)
+                text_hidden = text_outputs.last_hidden_state[:, 0]
+                
+                # Encode visual data (Placeholder: Replace with actual visual encoder)
+                visual_hidden = torch.nn.Linear(batch_visual.shape[-1], self.encoder.config.hidden_size)(batch_visual)
+                
+                # Fusion of both modalities
+                fused_representation = torch.cat((text_hidden, visual_hidden), dim=-1)
+                fused_representation = torch.nn.Linear(fused_representation.shape[-1], self.encoder.config.hidden_size)(fused_representation)
+                
+                # Compute loss
+                loss = loss_fn(fused_representation, text_hidden)
+                loss.backward()
+                optimizer.step()
+                
+                epoch_loss += loss.item()
+            
+            print(f"Epoch {epoch+1}/{num_epochs}, Loss: {epoch_loss/dataset_size}")
         
-        # Encode visual data (Placeholder: Replace with actual visual encoder)
-        visual_hidden = torch.nn.Linear(visual_inputs.shape[-1], self.encoder.config.hidden_size)(visual_inputs)
-        
-        # Fusion of both modalities
-        fused_representation = torch.cat((text_hidden, visual_hidden), dim=-1)
-        fused_representation = torch.nn.Linear(fused_representation.shape[-1], self.encoder.config.hidden_size)(fused_representation)
-        
-        # Compute loss
-        loss = loss_fn(fused_representation, text_hidden)  # Example loss function
-        loss.backward()
-        optimizer.step()
-        
-        return loss.item()
+        return epoch_loss / dataset_size
