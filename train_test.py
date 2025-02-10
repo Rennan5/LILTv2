@@ -2,6 +2,7 @@ import argparse
 import datetime
 import os
 import json
+import torch
 
 # import numpy as np
 
@@ -46,16 +47,29 @@ if __name__ == "__main__":
     train = txt_to_json(f'{dataset_path}/train.txt')
     val = txt_to_json(f'{dataset_path}/val.txt')
     test = txt_to_json(f'{dataset_path}/test.txt')
-    
-    model = LILTv2(num_tasks=2, epochs=epochs, batch_size=batch_size, learning_rate=learning_rate)
 
     # dataset = load_mixed_dataset(load_image=False, smoke_test=False, bbox_scale=1, train=train, dev=val, test=test)
     
-    boxes = []
-    for annotation in val[0]['annotations']:
-        annotation['box'] = convert_ocr_format(annotation['box'])
-        boxes.append(annotation['box'])
+    # Convert the boxes to the format expected by the model
+    #val_boxes = []
+    #for itera in val:
+    #    for annotation in itera['annotations']:
+    #        annotation['box'] = convert_ocr_format(annotation['box'])
+    #        val_boxes.append(annotation['box'])
 
-    boxes = sort_boxes(boxes)
+    test_boxes = []
+    for itera in test:
+        for annotation in itera['annotations']:
+            annotation['box'] = convert_ocr_format(annotation['box'])
+            test_boxes.append(annotation['box'])
 
-    print(model)
+    # AGS algorithm to sort boxes
+    #val_boxes = sort_boxes(val_boxes)
+    test_boxes = sort_boxes(test_boxes)
+
+    model = LILTv2(num_tasks=2, epochs=epochs, batch_size=batch_size, learning_rate=learning_rate)
+
+    for input_id, box in enumerate(test_boxes):
+        for task_id, task in enumerate(model.task_heads):
+            if task['type'] == 'classification':
+                model.train_step(input_ids=input_id, attention_mask=box, labels=task_id, task_id=task_id)

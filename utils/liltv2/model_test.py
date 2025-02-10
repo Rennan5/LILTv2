@@ -3,7 +3,7 @@ import torch.nn as nn
 from transformers import AutoModel
 
 class LILTv2(nn.Module):
-    def __init__(self, base_model_name="bert-base-uncased", epochs=10, batch_size=32, learning_rate=5e-5, num_tasks=None, task_heads=None):
+    def __init__(self, base_model_name="bert-base-uncased", epochs=10, batch_size=32, learning_rate=5e-5, num_tasks=None, task_heads=None, loss_func=nn.CrossEntropyLoss()):
         """
         Initialize the LILTv2 model.
 
@@ -21,6 +21,8 @@ class LILTv2(nn.Module):
         self.batch_size = batch_size
         self.learning_rate = learning_rate
         self.heads = []
+        self.loss_func = loss_func
+        self.optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate)
         
         if num_tasks is not None:
             self.task_heads = []
@@ -68,7 +70,7 @@ class LILTv2(nn.Module):
         output = self.task_heads[task_id](pooled_output)
         return output
 
-    def train_step(self, input_ids, attention_mask, labels, task_id, optimizer, loss_fn):
+    def train_step(self, input_ids, attention_mask, labels, task_id):
         """
         Perform a single training step with backpropagation.
 
@@ -77,12 +79,13 @@ class LILTv2(nn.Module):
             attention_mask (torch.Tensor): Attention mask.
             labels (torch.Tensor): Ground truth labels.
             task_id (int): Index of the task to process.
-            optimizer (torch.optim.Optimizer): Optimizer for training.
-            loss_fn (callable): Loss function.
 
         Returns:
             float: Computed loss value.
         """
+        optimizer = self.optimizer
+        loss_fn = self.loss_func
+        
         optimizer.zero_grad()
         outputs = self.forward(input_ids, attention_mask, task_id)
         loss = loss_fn(outputs, labels)
@@ -90,7 +93,7 @@ class LILTv2(nn.Module):
         optimizer.step()
         return loss.item()
 
-    def dual_stream_pretrain(self, text_inputs, visual_inputs, attention_mask, optimizer, loss_fn):
+    def dual_stream_pretrain(self, text_inputs, visual_inputs, attention_mask):
         """
         Dual-Stream Transformer Architecture for dataset pretraining.
 
@@ -98,8 +101,6 @@ class LILTv2(nn.Module):
             text_inputs (torch.Tensor): Input token IDs for text.
             visual_inputs (torch.Tensor): Input tensor for visual data.
             attention_mask (torch.Tensor): Attention mask for text inputs.
-            optimizer (torch.optim.Optimizer): Optimizer for training.
-            loss_fn (callable): Loss function.
 
         Returns:
             float: Computed loss value for the pretraining step.
@@ -107,6 +108,8 @@ class LILTv2(nn.Module):
         num_epochs = self.epochs
         batch_size = self.batch_size
         learning_rate = self.learning_rate
+        optimizer = self.optimizer
+        loss_fn = self.loss_func
         
         optimizer.param_groups[0]['lr'] = learning_rate
         dataset_size = text_inputs.shape[0]
@@ -140,3 +143,26 @@ class LILTv2(nn.Module):
             print(f"Epoch {epoch+1}/{num_epochs}, Loss: {epoch_loss/dataset_size}")
         
         return epoch_loss / dataset_size
+
+    def train_model(self, train_loader, task_id):
+        """
+        Train the model for multiple epochs.
+
+        Args:
+            train_loader (DataLoader): DataLoader for training data.
+            task_id (int): Index of the task to process.
+
+        """
+        num_epochs = self.epochs
+        optimizer = self.optimizer
+        loss_fn = self.loss_func
+        
+        for epoch in range(num_epochs):
+            total_loss = 0.0
+            for batch in train_loader:
+                input_ids, attention_mask, labels = batch
+                loss = self.train_step(input_ids, attention_mask, labels, task_id, optimizer, loss_fn)
+                total_loss += loss
+            
+            avg_loss = total_loss / len(train_loader)
+            print(f"Epoch {epoch+1}/{num_epochs}, Loss: {avg_loss}")
