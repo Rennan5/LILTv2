@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from transformers import AutoModel
+from transformers import AutoModel, AutoTokenizer
 
 class LILTv2(nn.Module):
     def __init__(self, base_model_name="bert-base-uncased", epochs=10, batch_size=32, learning_rate=5e-5, num_tasks=None, task_heads=None, loss_func=nn.CrossEntropyLoss()):
@@ -23,6 +23,7 @@ class LILTv2(nn.Module):
         self.heads = []
         self.loss_func = loss_func
         self.optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate)
+        self.tokenizer = AutoTokenizer.from_pretrained(base_model_name)
         
         if num_tasks is not None:
             self.task_heads = []

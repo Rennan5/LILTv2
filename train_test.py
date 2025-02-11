@@ -50,26 +50,45 @@ if __name__ == "__main__":
 
     # dataset = load_mixed_dataset(load_image=False, smoke_test=False, bbox_scale=1, train=train, dev=val, test=test)
     
-    # Convert the boxes to the format expected by the model
+    # Convert the boxes to the format expected by the model and getting input texts
+    #train_texts = []
+    #train_boxes = []
+    #for itera in train:
+    #    for annotation in itera['annotations']:
+    #        train_texts.append(annotation['text'])
+    #        annotation['box'] = convert_ocr_format(annotation['box'])
+    #        train_boxes.append(annotation['box'])
+    
+    #val_texts = []
     #val_boxes = []
     #for itera in val:
     #    for annotation in itera['annotations']:
+    #        val_texts.append(annotation['text'])
     #        annotation['box'] = convert_ocr_format(annotation['box'])
     #        val_boxes.append(annotation['box'])
 
+    test_texts = []
     test_boxes = []
     for itera in test:
         for annotation in itera['annotations']:
+            test_texts.append(annotation['text'])
             annotation['box'] = convert_ocr_format(annotation['box'])
             test_boxes.append(annotation['box'])
 
     # AGS algorithm to sort boxes
+    #train_boxes = sort_boxes(train_boxes)
     #val_boxes = sort_boxes(val_boxes)
     test_boxes = sort_boxes(test_boxes)
 
+    # Model instatiation
     model = LILTv2(num_tasks=2, epochs=epochs, batch_size=batch_size, learning_rate=learning_rate)
-
-    for input_id, box in enumerate(test_boxes):
-        for task_id, task in enumerate(model.task_heads):
-            if task['type'] == 'classification':
-                model.train_step(input_ids=input_id, attention_mask=box, labels=task_id, task_id=task_id)
+    
+    # Tokenization of inputs
+    input_tokens = model.tokenizer(test_texts, return_tensors="pt", padding=True, truncation=True)
+    labels = torch.tensor([1]).unsqueeze(0)
+    
+    #for input_id, box in enumerate(test_boxes):
+    #    for task_id, task in enumerate(model.task_heads):
+    #        if task['type'] == 'classification':
+    #            model.train_step(input_ids=test_boxes, attention_mask=box, labels=task_id, task_id=task_id)
+    model.train_step(input_ids=input_tokens['input_ids'], attention_mask=input_tokens['attention_mask'], labels=labels, task_id=0)
