@@ -33,7 +33,6 @@ class PatchEmbedding(nn.Module):
         Returns:
             Embeddings de patches (shape: [batch_size, num_patches, embed_dim]).
         """
-        batch_size = x.size(0)
         
         # Projeção para embeddings
         x = self.projection(x)  # Shape: [batch_size, embed_dim, H_patches, W_patches]

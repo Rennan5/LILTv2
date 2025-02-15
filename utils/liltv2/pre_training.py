@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from pre_training_classes import *
+from utils.liltv2.pre_training_classes import *
 
 class PretrainingModel(nn.Module):
     def __init__(self, vocab_size, embed_dim, grid_size=7, num_directions=8):
