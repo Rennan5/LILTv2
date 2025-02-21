@@ -1,5 +1,8 @@
 import torch
 import torch.nn as nn
+import torch.optim as optim
+from transformers import get_scheduler
+from tqdm import tqdm
 
 class MVLMTask(nn.Module):
     def __init__(self, vocab_size, embed_dim):
@@ -48,36 +51,60 @@ class WPATask(nn.Module):
         self.alignment_score = nn.Sequential(
             nn.Linear(embed_dim * 2, embed_dim),
             nn.ReLU(),
-            nn.Linear(embed_dim, 1),  # Escalar de alinhamento
-            nn.Sigmoid()  # Probabilidade de alinhamento
+            nn.Linear(embed_dim, 1),
+            nn.Sigmoid()
         )
 
     def forward(self, token_embeds, patch_embeds):
-        """
-        Args:
-            token_embeds: Embeddings dos tokens de texto (B, T, embed_dim).
-            patch_embeds: Embeddings dos patches de imagem (B, P, embed_dim).
-        
-        Returns:
-            Probabilidades de alinhamento (B, T, P).
-        """
-        # Expandir dimensões para calcular alinhamento entre todos os pares
         T, P = token_embeds.size(1), patch_embeds.size(1)
-        token_embeds = token_embeds.unsqueeze(2).expand(-1, -1, P, -1)  # (B, T, P, embed_dim)
-        patch_embeds = patch_embeds.unsqueeze(1).expand(-1, T, -1, -1)  # (B, T, P, embed_dim)
-
-        # Concatenar e calcular score de alinhamento
-        pairwise_features = torch.cat([token_embeds, patch_embeds], dim=-1)  # (B, T, P, 2*embed_dim)
-        alignment_scores = self.alignment_score(pairwise_features).squeeze(-1)  # (B, T, P)
+        token_embeds = token_embeds.unsqueeze(2).expand(-1, -1, P, -1)
+        patch_embeds = patch_embeds.unsqueeze(1).expand(-1, T, -1, -1)
+        pairwise_features = torch.cat([token_embeds, patch_embeds], dim=-1)
+        alignment_scores = self.alignment_score(pairwise_features).squeeze(-1)
         return alignment_scores
+
+    def train_task(self, train_dataset, val_dataset, training_args):
+        """
+        Treina a tarefa WPA (Word-Patch Alignment).
+        """
+        print("Treinando WPA...")  
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.to(device)
+
+        # Otimizador e função de perda
+        optimizer = optim.AdamW(self.parameters(), lr=training_args.learning_rate)
+        loss_fn = nn.BCEWithLogitsLoss()
+
+        num_training_steps = training_args.num_train_epochs * len(train_dataset)
+        lr_scheduler = get_scheduler(
+            "linear", optimizer=optimizer, num_warmup_steps=0, num_training_steps=num_training_steps
+        )
+
+        for epoch in range(training_args.num_train_epochs):
+            self.train()
+            total_loss = 0
+
+            for batch in tqdm(train_dataset, desc=f"Época {epoch + 1}/{training_args.num_train_epochs} - Treinamento WPA"):
+                token_embeds = batch["token_embeds"].to(device)  # (B, T, embed_dim)
+                patch_embeds = batch["patch_embeds"].to(device)  # (B, P, embed_dim)
+                alignment_labels = batch["alignment_labels"].to(device)  # (B, T, P)
+
+                optimizer.zero_grad()
+                alignment_preds = self.forward(token_embeds, patch_embeds)
+                loss = loss_fn(alignment_preds, alignment_labels)
+                loss.backward()
+                optimizer.step()
+                lr_scheduler.step()
+
+                total_loss += loss.item()
+                
+        print("Treinamento de WPA finalizado!")
     
 class KPLTask(nn.Module):
     def __init__(self, embed_dim):
         """
         Implementa a tarefa KPL (Key Point Location).
-        
-        Args:
-            embed_dim: Dimensão dos embeddings.
         """
         super(KPLTask, self).__init__()
         self.mlp = nn.Sequential(
@@ -87,14 +114,45 @@ class KPLTask(nn.Module):
         )
 
     def forward(self, text_embeds):
-        """
-        Args:
-            text_embeds: Tensor de embeddings de texto (B, T, embed_dim).
-        
-        Returns:
-            Previsão de bounding boxes (B, T, 4).
-        """
         return self.mlp(text_embeds)
+
+    def train_task(self, train_dataset, val_dataset, training_args):
+        """
+        Treina a tarefa KPL (Key Point Location).
+        """
+        print("Treinando KPL...")
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.to(device)
+
+        # Otimizador e função de perda
+        optimizer = optim.AdamW(self.parameters(), lr=training_args.learning_rate)
+        loss_fn = nn.MSELoss()  # Para prever coordenadas contínuas
+
+        num_training_steps = training_args.num_train_epochs * len(train_dataset)
+        lr_scheduler = get_scheduler(
+            "linear", optimizer=optimizer, num_warmup_steps=0, num_training_steps=num_training_steps
+        )
+
+        for epoch in range(training_args.num_train_epochs):
+            self.train()
+            total_loss = 0
+
+            for batch in tqdm(train_dataset, desc=f"Época {epoch + 1}/{training_args.num_train_epochs} - Treinamento KPL"):
+                text_embeds = batch["text_embeds"].to(device)  # (B, T, embed_dim)
+                bbox_labels = batch["bbox_labels"].to(device)  # (B, T, 4)
+
+                optimizer.zero_grad()
+                bbox_preds = self.forward(text_embeds)
+                loss = loss_fn(bbox_preds, bbox_labels)
+                loss.backward()
+                optimizer.step()
+                lr_scheduler.step()
+
+                total_loss += loss.item()
+
+        print("Treinamento de KPL finalizado!")
+
 
 class RPCTask(nn.Module):
     def __init__(self, embed_dim, num_classes):

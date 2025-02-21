@@ -146,11 +146,6 @@ class LiltModel:
 
         trainer.train()
 
-        # Realize o pré-treinamento para cada tarefa adicional
-        for task_name, task in self.tasks.items():
-            print(f"Treinando a tarefa {task_name}...")
-            task.train(train_dataset_proc, val_dataset_proc, training_args)
-
         trainer.save_model()
 
     def predict(self, dataset, batch_size=1):
@@ -255,10 +250,16 @@ class LiltModel:
         if image_embeds is not None and text_layout is not None and image_layout is not None:
             hidden_state, _ = self.daem(hidden_state, image_embeds, text_layout, image_layout)
 
+        alignment_scores = self.tasks["WPA"](hidden_state, image_embeds)  # (B, T, P)
+        hidden_state += alignment_scores.mean(dim=-1, keepdim=True)  
+
+        keypoint_preds = self.tasks["KPL"](hidden_state)  # (B, T, 4)
+        hidden_state += keypoint_preds.mean(dim=-1, keepdim=True)  
+
         fused_state = self.dual_stream(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            layout_images=images,  # Passando imagens para processamento
+            layout_images=images,  
             task_id=task_id
         )
 
