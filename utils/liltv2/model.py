@@ -194,12 +194,7 @@ class LiltModel:
                 'labels': labels.tolist()[i]
             }
 
-        task_results = {}
-        for task_name, task in self.tasks.items():
-            print(f"Executando predição para a tarefa {task_name}...")
-            task_results[task_name] = task.predict(dataset_proc)
-
-        return results, metrics, prediction_duration, task_results
+        return results, metrics, prediction_duration
 
     def load(self, path):
         pretrained_dict = torch.load(
