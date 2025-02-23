@@ -134,8 +134,8 @@ if __name__ == '__main__':
     model.save()
 
     # Results
-    val_results, val_metrics, val_duration, pretrain_val_results = model.predict(dataset['val'])
-    test_results, test_metrics, test_duration, pretrain_test_results = model.predict(dataset['test'])
+    val_results, val_metrics, val_duration = model.predict(dataset['val'])
+    test_results, test_metrics, test_duration = model.predict(dataset['test'])
     print(val_metrics)
     print(test_metrics)
 
@@ -146,7 +146,3 @@ if __name__ == '__main__':
     save_metrics(os.path.join(repository_id, 'val'), val_metrics)
     save_results(os.path.join(repository_id, 'test'), _test_results)
     save_metrics(os.path.join(repository_id, 'test'), test_metrics)
-    if pretrain_val_results:
-        save_results(os.path.join(repository_id, 'val_pretrain'), pretrain_val_results)
-    if pretrain_test_results:
-        save_results(os.path.join(repository_id, 'test_pretrain'), pretrain_test_results)
