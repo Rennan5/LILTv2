@@ -20,8 +20,81 @@ import os
 
 import evaluate
 import numpy as np
-from transformers import Trainer, TrainingArguments
+from transformers import Trainer, TrainingArguments, LiltConfig
 import torch
+
+class CustomLiltModel(LiltForTokenClassification, nn.Module):
+    def __init__(self, config, tokenizer, daem, dual_stream, patch_embedding, visual_embedding, tasks):
+        super().__init__(config)
+        self.tokenizer = tokenizer  
+        self.daem = daem
+        self.dual_stream = dual_stream
+        self.patch_embedding = patch_embedding
+        self.visual_embedding = visual_embedding
+        self.tasks = tasks
+
+    def forward(self, input_ids, attention_mask, labels=None, images=None, visual_features=None, text_layout=None, image_layout=None, task_id=0):
+        """
+        Forward pass combinando DAEM e Dual-Stream Attention.
+        """
+        
+        encoder_outputs = super().forward(input_ids=input_ids, attention_mask=attention_mask)
+        hidden_state = encoder_outputs.hidden_states[-1]  # Última camada oculta
+
+        image_embeds = self.patch_embedding(images) if images is not None else None
+
+        if visual_features is not None:
+            visual_embeds = self.visual_embedding(visual_features)
+            hidden_state += visual_embeds  # Incorporando informações visuais no texto
+
+        if image_embeds is not None and text_layout is not None and image_layout is not None:
+            hidden_state, _ = self.daem(hidden_state, image_embeds, text_layout, image_layout)
+
+        '''
+        TODO
+
+        masked_indices = (input_ids == self.tokenizer.mask_token_id)
+        mvlm_preds = self.tasks["MVLM"](text_tokens=input_ids, layout_boxes=text_layout, image_features=image_embeds, masked_indices=masked_indices)
+        
+        if mvlm_preds.numel() > 0:
+            mvlm_preds_mean = mvlm_preds.mean(dim=-1, keepdim=True)
+            hidden_state += mvlm_preds_mean.expand_as(hidden_state).to(hidden_state.device)
+
+        keypoint_preds = self.tasks["KPL"](hidden_state)
+        hidden_state += keypoint_preds.mean(dim=-1, keepdim=True)  
+
+        rpc_preds = self.tasks["RPC"](text_layout, image_layout)
+        hidden_state += rpc_preds.mean(dim=-1, keepdim=True)   
+
+        alignment_scores = self.tasks["WPA"](hidden_state, image_embeds)
+        hidden_state += alignment_scores.mean(dim=-1, keepdim=True)
+        '''
+
+        # Dual-Stream Attention
+        '''
+        TODO
+
+        fused_state = self.dual_stream(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            layout_images=images,  
+            task_id=task_id
+        )
+        '''
+        
+        #combined_state = hidden_state + fused_state # Fusão dos embeddings
+        combined_state = hidden_state
+        
+        logits = self.classifier(combined_state)
+
+        output = {"logits": logits}
+
+        if labels is not None:
+            loss_fn = nn.CrossEntropyLoss()
+            loss = loss_fn(logits.view(-1, self.config.num_labels), labels.view(-1))
+            output["loss"] = loss
+
+        return output
 
 def process_lilt(dataset, labels, tokenizer,ags):
     ## we need to define custom features
@@ -59,7 +132,6 @@ def process_lilt(dataset, labels, tokenizer,ags):
 
     return dataset_processed
 
-
 class LiltModel:
     def __init__(self, repository_id, labels):
         self.repository_id = repository_id
@@ -69,10 +141,14 @@ class LiltModel:
         label2id = {k: v for v, k in enumerate(labels)}
 
         self.ags = AGS()
-
         self.tokenizer = LayoutLMv3TokenizerFast.from_pretrained(model_id)
-        self.model = LiltForTokenClassification.from_pretrained(
-            model_id, num_labels=len(labels), label2id=label2id, id2label=id2label
+
+        config = LiltConfig.from_pretrained(
+            model_id, 
+            num_labels=len(labels), 
+            label2id=label2id, 
+            id2label=id2label,
+            output_hidden_states=True  # Permite acessar as camadas ocultas
         )
 
         self.dual_stream = DualStreamAttentionLiLTv2(
@@ -82,32 +158,97 @@ class LiltModel:
         )
 
         self.daem = DAEM(
-            d_model=self.model.config.hidden_size,
+            d_model=config.hidden_size,
             n_heads=8, ff_dim=2048, n_layers=2, dropout=0.1
         )
 
-        self.patch_embedding = PatchEmbedding(img_size=224, patch_size=16, embed_dim=self.model.config.hidden_size)
-        self.visual_embedding = TokenVisualEmbedding(embed_dim=self.model.config.hidden_size)
-        
+        self.patch_embedding = PatchEmbedding(img_size=224, patch_size=16, embed_dim=config.hidden_size)
+        self.visual_embedding = TokenVisualEmbedding(embed_dim=config.hidden_size)
+
+        self.model = CustomLiltModel(
+            config=config,
+            tokenizer=self.tokenizer,  
+            daem=self.daem,
+            dual_stream=self.dual_stream,
+            patch_embedding=self.patch_embedding,
+            visual_embedding=self.visual_embedding,
+            tasks=None
+        )
+
         self.tasks = {
-            #'MVLM': MVLMTask(labels=labels, embed_dim=self.model.config.hidden_size),
-            'KPL': KPLTask(embed_dim=self.model.config.hidden_size),
-            #'RPC': RPCTask(num_classes=8, embed_dim=self.model.config.hidden_size),
-            'WPA': WPATask(embed_dim=self.model.config.hidden_size)
+            'MVLM': MVLMTask(model=self.model, tokenizer=self.tokenizer, vocab_size=len(self.tokenizer)),
+            'WPA': WPATask(model=self.model, patch_size=16, img_size=224),
+            'KPL': KPLTask(model=self.model, grid_size=7, num_classes=49),
+            'RPC': RPCTask(model=self.model, input_dim=config.hidden_size, hidden_dim=256, num_directions=8, num_distances=5)
         }
+
+        self.model.tasks = self.tasks
+        
+        '''
+        TODO
+
+        Adicionar treinamento das tasks (chamar train_task para cada task de self.tasks)
+        '''
 
         self.apply_lora()
 
-    def apply_lora(self):
-        """Substitui camadas lineares por versões com LoRA."""
-        for name, module in self.model.named_children():
-            if isinstance(module, nn.Linear):  # Aplicar apenas em camadas lineares
-                setattr(self.model, name, LoRALayer(module.in_features, module.out_features, rank=4))
+    def get_parent_module(self, module_name):
+        """
+        Retorna o módulo pai e o nome do submódulo a ser substituído.
 
-    def fit(self, train_dataset, val_dataset, max_epochs=1, learning_rate=5e-5, batch_size=1, patience=None):
+        Args:
+            module_name (str): Nome completo do módulo a ser substituído (ex: "dual_stream.text_encoder.encoder.layer.11.attention.self.query").
+
+        Returns:
+            parent_module (torch.nn.Module): Módulo pai.
+            child_name (str): Nome do submódulo dentro do módulo pai.
+        """
+        names = module_name.split('.')
+        parent = self.model  # Começa no modelo principal
+
+        for name in names[:-1]:  # Navega pelos submódulos até o penúltimo nível
+            parent = getattr(parent, name)
+
+        return parent, names[-1]  # Retorna o módulo pai e o nome do submódulo
+
+    def apply_lora(self):
+        modules_to_replace = []
+        for name, module in self.model.named_modules():
+            if isinstance(module, torch.nn.Linear) and "dual_stream.text_encoder" in name:
+                modules_to_replace.append((name, module))
+                
+        for name, module in modules_to_replace:
+            parent_module, child_name = self.get_parent_module(name)
+            setattr(parent_module, child_name, LoRALinear(module))
+
+    def fit(self, train_dataset, val_dataset, max_epochs=1, learning_rate=5e-5, batch_size=1, patience=None,training_args=None):
+
+        if training_args is None:
+            training_args = TrainingArguments(
+                output_dir=os.path.join(self.repository_id, 'checkpoints'),
+                evaluation_strategy="epoch",
+                save_strategy="epoch",
+                per_device_train_batch_size=batch_size,
+                per_device_eval_batch_size=batch_size,
+                learning_rate=learning_rate,
+                num_train_epochs=max_epochs,
+                weight_decay=0.01,
+                warmup_ratio=0.1,
+                lr_scheduler_type="linear",
+            )
+
         ner_labels = list(self.model.config.id2label.values())
         metric = evaluate.load("seqeval")
 
+        """
+        for task_name, task in self.tasks.items():
+            print(f"Treinando {task_name}...")
+            task.train_task(train_dataset, val_dataset, training_args)
+
+            task_weights_path = f"{training_args.output_dir}/{task_name.lower()}_task.pth"
+            print(f"Carregando pesos de {task_name}...")
+            task.load_state_dict(torch.load(task_weights_path, map_location="cuda" if torch.cuda.is_available() else "cpu"))
+        """
         def compute_metrics(p):
             predictions, labels = p
             predictions = np.argmax(predictions, axis=2)
@@ -124,17 +265,6 @@ class LiltModel:
 
         train_dataset_proc = process_lilt(train_dataset, ner_labels, self.tokenizer,self.ags)
         val_dataset_proc = process_lilt(val_dataset, ner_labels, self.tokenizer,self.ags)
-
-        training_args = TrainingArguments(
-            output_dir=os.path.join(self.repository_id, 'checkpoints'),
-            logging_dir=f"{self.repository_id}/logs",
-            evaluation_strategy="epoch", metric_for_best_model="overall_f1",
-            save_strategy="no" if patience is None else "epoch",
-            save_total_limit=1 if patience is None else patience + 1,
-            load_best_model_at_end=bool(patience is not None),
-            per_device_train_batch_size=batch_size, per_device_eval_batch_size=batch_size,
-            learning_rate=learning_rate, num_train_epochs=max_epochs
-        )
 
         trainer = Trainer(
             model=self.model,
@@ -215,58 +345,3 @@ class LiltModel:
                 'model_type': 'LILT',
                 'labels': list(self.model.config.id2label.values())
             }))
-
-    def forward(self, input_ids, attention_mask, labels=None, images=None, visual_features=None, text_layout=None, image_layout=None, task_id=0):
-        """
-        Forward pass combinando DAEM e Dual-Stream Attention.
-
-        Args:
-            input_ids (torch.Tensor): IDs dos tokens do texto.
-            attention_mask (torch.Tensor): Máscara de atenção.
-            labels (torch.Tensor, opcional): Rótulos para o treinamento.
-            images (torch.Tensor, opcional): Representações das imagens/layouts.
-            visual_features (torch.Tensor, opcional): Embeddings visuais dos tokens.
-            text_layout (torch.Tensor, opcional): Layout dos textos.
-            image_layout (torch.Tensor, opcional): Layout das imagens.
-            task_id (int): Índice da tarefa a ser processada.
-
-        Returns:
-            Dict com logits e, opcionalmente, loss.
-        """
-        encoder_outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
-        hidden_state = encoder_outputs.last_hidden_state  # Representação textual
-
-        image_embeds = self.patch_embedding(images) if images is not None else None
-
-        if visual_features is not None:
-            visual_embeds = self.visual_embedding(visual_features)
-            hidden_state += visual_embeds  # Incorporando informações visuais no texto
-
-        if image_embeds is not None and text_layout is not None and image_layout is not None:
-            hidden_state, _ = self.daem(hidden_state, image_embeds, text_layout, image_layout)
-
-        alignment_scores = self.tasks["WPA"](hidden_state, image_embeds)  # (B, T, P)
-        hidden_state += alignment_scores.mean(dim=-1, keepdim=True)  
-
-        keypoint_preds = self.tasks["KPL"](hidden_state)  # (B, T, 4)
-        hidden_state += keypoint_preds.mean(dim=-1, keepdim=True)  
-
-        fused_state = self.dual_stream(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            layout_images=images,  
-            task_id=task_id
-        )
-
-        combined_state = hidden_state + fused_state  # Fusão dos embeddings
-
-        logits = self.model.classifier(combined_state)
-
-        output = {"logits": logits}
-
-        if labels is not None:
-            loss_fn = nn.CrossEntropyLoss()
-            loss = loss_fn(logits.view(-1, self.model.config.num_labels), labels.view(-1))
-            output["loss"] = loss
-
-        return output

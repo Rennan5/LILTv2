@@ -41,15 +41,15 @@ class DualStreamAttentionLiLTv2(nn.Module):
         # Layout embeddings (CNN-based)
         layout_embeds = self.layout_encoder(layout_images)  # Shape: (B, D, H, W)
         layout_embeds = layout_embeds.flatten(2).transpose(1, 2)  # Shape: (B, L, D)
-
+        
         # Aplicar DAEM (atenção cruzada)
         text_refined, _ = self.text_to_layout_attn(text_hidden_state, layout_embeds, layout_embeds)
         layout_refined, _ = self.layout_to_text_attn(layout_embeds, text_hidden_state, text_hidden_state)
-
+        
         # Combinar os embeddings refinados
         combined_state = torch.cat((text_refined[:, 0], layout_refined[:, 0]), dim=-1)
         fused_state = self.fusion_layer(combined_state)
-
+        
         # Passar para a task head
         output = self.task_heads[task_id](fused_state)
         return output

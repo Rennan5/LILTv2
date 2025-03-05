@@ -3,38 +3,38 @@ import torch.nn as nn
 
 class LoRALayer(nn.Module):
     def __init__(self, in_features, out_features, rank=4, alpha=1.0):
+        super().__init__()
+        self.rank = rank
+        self.alpha = alpha / rank
+        self.A = nn.Parameter(torch.randn(in_features, rank) * 0.01)
+        self.B = nn.Parameter(torch.randn(rank, out_features) * 0.01)
+
+    def forward(self, x, weight):
+        delta_w = self.A @ self.B * self.alpha
+        return x @ (weight + delta_w).T
+
+class LoRALinear(nn.Module):
+    def __init__(self, original_linear, rank=4, alpha=1.0):
         """
-        LoRA layer for adapting a dense layer.
+        Substitui uma camada Linear por uma versão compatível com LoRA, mantendo a camada original.
 
         Args:
-            in_features (int): Input dimensionality.
-            out_features (int): Output dimensionality.
-            rank (int): Low-rank value.
-            alpha (float): Scaling factor for LoRA updates.
+            original_linear (nn.Linear): Camada Linear original a ser ajustada com LoRA.
+            rank (int): Dimensão do espaço de menor dimensão para LoRA.
+            alpha (float): Fator de escala para a adaptação.
         """
-        super(LoRALayer, self).__init__()
-        self.rank = rank
-        self.alpha = alpha
-
-        self.weight = nn.Parameter(torch.randn(out_features, in_features), requires_grad=False)
-
-        self.A = nn.Parameter(torch.randn(out_features, rank) * 0.01)
-        self.B = nn.Parameter(torch.randn(rank, in_features) * 0.01)
-
-        self.scaling = alpha / rank
+        super().__init__()
+        self.original_linear = original_linear
+        self.lora = LoRALayer(original_linear.in_features, original_linear.out_features, rank, alpha)
 
     def forward(self, x):
         """
-        Forward pass for the LoRA layer.
+        Forward passa o input tanto pela camada original quanto pela LoRA.
 
         Args:
-            x (torch.Tensor): Input tensor with shape (batch_size, in_features).
+            x (torch.Tensor): Entrada do modelo.
 
         Returns:
-            torch.Tensor: Output tensor with shape (batch_size, out_features).
+            torch.Tensor: Saída combinada da camada original e da LoRA.
         """
-        delta_w = torch.einsum("oi,ij->oj", self.A, self.B) * self.scaling
-
-        adapted_weight = self.weight + delta_w
-
-        return x @ adapted_weight.T
+        return self.original_linear(x) + self.lora(x)

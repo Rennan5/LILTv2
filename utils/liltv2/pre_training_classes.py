@@ -1,183 +1,381 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from transformers import get_scheduler
+import torch.nn.functional as F
+from transformers import Trainer,get_scheduler
+from torch.utils.data import DataLoader
+import torch.optim as optim
 from tqdm import tqdm
 
 class MVLMTask(nn.Module):
-    def __init__(self, vocab_size, embed_dim):
+    def __init__(self, model, tokenizer, vocab_size, mask_prob=0.15, lr=5e-5):
         """
-        Implementa a tarefa MVLM (Masked Visual-Language Modeling).
-        
+        Classe para treinar a Masked Visual-Language Modeling (MVLM).
+
         Args:
+            model: O modelo LiLTv2 ou outro modelo baseado em Transformer.
+            tokenizer: Tokenizer do LayoutLMv3 ou equivalente.
             vocab_size: Tamanho do vocabulário.
-            embed_dim: Dimensão dos embeddings.
+            mask_prob: Probabilidade de mascaramento (padrão 15%).
+            lr: Taxa de aprendizado para o otimizador.
         """
-        super(MVLMTask, self).__init__()
-        self.text_embedding = nn.Embedding(vocab_size, embed_dim)
-        self.layout_embedding = nn.Linear(4, embed_dim)  # Coordenadas (x1, y1, x2, y2)
-        self.image_embedding = nn.Linear(embed_dim, embed_dim)
-        self.decoder = nn.Linear(embed_dim, vocab_size)
+        super().__init__()
+        self.model = model
+        self.tokenizer = tokenizer
+        self.vocab_size = vocab_size
+        self.mask_prob = mask_prob
+        self.optimizer = optim.AdamW(self.model.parameters(), lr=lr)
 
-    def forward(self, text_tokens, layout_boxes, image_features, masked_indices):
+    def mask_tokens(self, input_ids):
         """
-        Args:
-            text_tokens: Tensor de texto (B, T) com IDs dos tokens.
-            layout_boxes: Tensor com bounding boxes (B, T, 4).
-            image_features: Tensor de características visuais (B, T, embed_dim).
-            masked_indices: Máscara indicando os tokens mascarados (B, T).
+        Aplica a máscara nos tokens de entrada, seguindo a regra 80%-10%-10%.
+        """
+        device = input_ids.device
+        labels = input_ids.clone()
+
+        probability_matrix = torch.full(input_ids.shape, self.mask_prob, device=device)
+        masked_indices = torch.bernoulli(probability_matrix).bool()
+        mask_token_id = self.tokenizer.convert_tokens_to_ids("[MASK]")
         
-        Returns:
-            Previsões de tokens mascarados (B, T, vocab_size).
+        masked_input = input_ids.clone()
+        masked_input[masked_indices] = mask_token_id
+
+        # 10% dos tokens mascarados -> substituídos por palavras aleatórias
+        random_tokens = torch.randint(self.vocab_size, input_ids.shape, dtype=torch.long, device=device)
+        random_indices = torch.bernoulli(torch.full(input_ids.shape, 0.10, device=device)).bool() & masked_indices
+        masked_input[random_indices] = random_tokens[random_indices]
+
+        labels[~masked_indices] = -100  # Ignorar os tokens não mascarados
+        return masked_input, labels
+
+    def forward(self, input_ids, attention_mask):
         """
-        # Embeddings
-        text_embeds = self.text_embedding(text_tokens)          # (B, T, embed_dim)
-        layout_embeds = self.layout_embedding(layout_boxes)     # (B, T, embed_dim)
-        image_embeds = self.image_embedding(image_features)     # (B, T, embed_dim)
+        Executa um forward pass com a MVLM.
+        """
+        masked_input, labels = self.mask_tokens(input_ids)
+        outputs = self.model(masked_input, attention_mask=attention_mask)
+        logits = outputs.logits  # Saída do modelo
+        loss = nn.CrossEntropyLoss(ignore_index=-100)(logits.view(-1, self.vocab_size), labels.view(-1))
+        return loss
 
-        # Combinação multimodal
-        combined_embeds = text_embeds + layout_embeds + image_embeds
+    def train_task(self, dataloader, num_epochs, output_dir):
+        """
+        Treina a MVLM e salva o estado do modelo.
+        """
+        self.train()
+        for epoch in range(num_epochs):
+            total_loss = 0
+            for batch in dataloader:
+                input_ids, attention_mask = batch["input_ids"].to(self.model.device), batch["attention_mask"].to(self.model.device)
+                
+                self.optimizer.zero_grad()
+                loss = self(input_ids, attention_mask)
+                loss.backward()
+                self.optimizer.step()
+                
+                total_loss += loss.item()
+            
+            avg_loss = total_loss / len(dataloader)
+            print(f"Epoch {epoch+1}/{num_epochs}, Loss: {avg_loss:.4f}")
 
-        # Aplicar a máscara
-        masked_embeds = combined_embeds[masked_indices]
-
-        # Previsão dos tokens mascarados
-        predictions = self.decoder(masked_embeds)  # (num_masked, vocab_size)
-        return predictions
+        torch.save(self.state_dict(), f"{output_dir}/mvlm_task.pth")
+        print("Treinamento concluído e modelo salvo!")
 
 class WPATask(nn.Module):
-    def __init__(self, embed_dim):
-        super(WPATask, self).__init__()
-        self.alignment_score = nn.Sequential(
-            nn.Linear(embed_dim * 2, embed_dim),
-            nn.ReLU(),
-            nn.Linear(embed_dim, 1),
-            nn.Sigmoid()
-        )
-
-    def forward(self, token_embeds, patch_embeds):
-        T, P = token_embeds.size(1), patch_embeds.size(1)
-        token_embeds = token_embeds.unsqueeze(2).expand(-1, -1, P, -1)
-        patch_embeds = patch_embeds.unsqueeze(1).expand(-1, T, -1, -1)
-        pairwise_features = torch.cat([token_embeds, patch_embeds], dim=-1)
-        alignment_scores = self.alignment_score(pairwise_features).squeeze(-1)
-        return alignment_scores
-
-    def train_task(self, train_dataset, val_dataset, training_args):
+    def __init__(self, model, patch_size, img_size, lr=5e-5):
         """
-        Treina a tarefa WPA (Word-Patch Alignment).
-        """
-        print("Treinando WPA...")  
+        Implementação da Word-Patch Alignment (WPA).
 
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.to(device)
-
-        # Otimizador e função de perda
-        optimizer = optim.AdamW(self.parameters(), lr=training_args.learning_rate)
-        loss_fn = nn.BCEWithLogitsLoss()
-
-        num_training_steps = training_args.num_train_epochs * len(train_dataset)
-        lr_scheduler = get_scheduler(
-            "linear", optimizer=optimizer, num_warmup_steps=0, num_training_steps=num_training_steps
-        )
-
-        for epoch in range(training_args.num_train_epochs):
-            self.train()
-            total_loss = 0
-
-            for batch in tqdm(train_dataset, desc=f"Época {epoch + 1}/{training_args.num_train_epochs} - Treinamento WPA"):
-                token_embeds = batch["token_embeds"].to(device)  # (B, T, embed_dim)
-                patch_embeds = batch["patch_embeds"].to(device)  # (B, P, embed_dim)
-                alignment_labels = batch["alignment_labels"].to(device)  # (B, T, P)
-
-                optimizer.zero_grad()
-                alignment_preds = self.forward(token_embeds, patch_embeds)
-                loss = loss_fn(alignment_preds, alignment_labels)
-                loss.backward()
-                optimizer.step()
-                lr_scheduler.step()
-
-                total_loss += loss.item()
-                
-        print("Treinamento de WPA finalizado!")
-    
-class KPLTask(nn.Module):
-    def __init__(self, embed_dim):
-        """
-        Implementa a tarefa KPL (Key Point Location).
-        """
-        super(KPLTask, self).__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim),
-            nn.ReLU(),
-            nn.Linear(embed_dim, 4)  # Previsão de (x1, y1, x2, y2)
-        )
-
-    def forward(self, text_embeds):
-        return self.mlp(text_embeds)
-
-    def train_task(self, train_dataset, val_dataset, training_args):
-        """
-        Treina a tarefa KPL (Key Point Location).
-        """
-        print("Treinando KPL...")
-
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.to(device)
-
-        # Otimizador e função de perda
-        optimizer = optim.AdamW(self.parameters(), lr=training_args.learning_rate)
-        loss_fn = nn.MSELoss()  # Para prever coordenadas contínuas
-
-        num_training_steps = training_args.num_train_epochs * len(train_dataset)
-        lr_scheduler = get_scheduler(
-            "linear", optimizer=optimizer, num_warmup_steps=0, num_training_steps=num_training_steps
-        )
-
-        for epoch in range(training_args.num_train_epochs):
-            self.train()
-            total_loss = 0
-
-            for batch in tqdm(train_dataset, desc=f"Época {epoch + 1}/{training_args.num_train_epochs} - Treinamento KPL"):
-                text_embeds = batch["text_embeds"].to(device)  # (B, T, embed_dim)
-                bbox_labels = batch["bbox_labels"].to(device)  # (B, T, 4)
-
-                optimizer.zero_grad()
-                bbox_preds = self.forward(text_embeds)
-                loss = loss_fn(bbox_preds, bbox_labels)
-                loss.backward()
-                optimizer.step()
-                lr_scheduler.step()
-
-                total_loss += loss.item()
-
-        print("Treinamento de KPL finalizado!")
-
-
-class RPCTask(nn.Module):
-    def __init__(self, embed_dim, num_classes):
-        """
-        Implementa a tarefa RPC (Relative Position Classification).
-        
         Args:
-            embed_dim: Dimensão dos embeddings.
-            num_classes: Número de classes para posição relativa.
+            model: O modelo LiLTv2 ou outro modelo baseado em Transformer.
+            patch_size: Tamanho do patch de imagem.
+            img_size: Tamanho da imagem de entrada.
+            lr: Taxa de aprendizado para o otimizador.
         """
-        super(RPCTask, self).__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(embed_dim * 2, embed_dim),
-            nn.ReLU(),
-            nn.Linear(embed_dim, num_classes)  # Classes para posição relativa
-        )
+        super().__init__()
+        self.model = model
+        self.patch_size = patch_size
+        self.img_size = img_size
+        self.num_patches = (img_size // patch_size) ** 2
+        self.classifier = nn.Linear(model.config.hidden_size, 2)  # Binário: mascarado ou não
+        self.optimizer = optim.AdamW(self.model.parameters(), lr=lr)
 
-    def forward(self, box1_embeds, box2_embeds):
+    def mask_patches(self, patch_embeddings, mask_prob=0.15):
         """
+        Aplica a máscara nos patches de imagem.
+
         Args:
-            box1_embeds: Embeddings da primeira caixa (B, T, embed_dim).
-            box2_embeds: Embeddings da segunda caixa (B, T, embed_dim).
-        
+            patch_embeddings (torch.Tensor): Embeddings dos patches da imagem.
+            mask_prob (float): Probabilidade de mascaramento (15% por padrão).
+
         Returns:
-            Classes previstas para a posição relativa (B, T, num_classes).
+            masked_patches (torch.Tensor): Patches mascarados.
+            labels (torch.Tensor): Rótulos indicando quais patches foram mascarados.
         """
-        relative_features = torch.cat([box1_embeds, box2_embeds], dim=-1)
-        return self.mlp(relative_features)
+        batch_size, num_patches, hidden_dim = patch_embeddings.shape
+        labels = torch.zeros(batch_size, num_patches, dtype=torch.long, device=patch_embeddings.device)
+        
+        # Seleciona patches a serem mascarados
+        mask = torch.rand(batch_size, num_patches, device=patch_embeddings.device) < mask_prob
+        labels[mask] = 1  # Define os patches mascarados como 1
+
+        masked_patches = patch_embeddings.clone()
+
+        # 80% dos patches mascarados -> substituídos por um token especial de máscara
+        mask_token = torch.zeros_like(masked_patches)  # Patches zerados atuam como token de máscara
+        masked_patches[mask] = mask_token[mask]
+
+        # 10% dos patches mascarados -> substituídos por patches aleatórios
+        random_patches = torch.randn_like(patch_embeddings)
+        random_indices = torch.rand(batch_size, num_patches, device=patch_embeddings.device) < 0.10
+        random_indices &= mask  # Apenas entre os mascarados
+        masked_patches[random_indices] = random_patches[random_indices]
+
+        # 10% restantes permanecem inalterados (já feito pela inicialização)
+        return masked_patches, labels
+
+    def forward(self, patch_embeddings):
+        """
+        Forward pass da tarefa WPA.
+
+        Args:
+            patch_embeddings (torch.Tensor): Embeddings dos patches de imagem.
+
+        Returns:
+            loss (torch.Tensor): Perda da tarefa WPA.
+        """
+        masked_patches, labels = self.mask_patches(patch_embeddings)
+        logits = self.classifier(masked_patches)
+        loss = nn.CrossEntropyLoss()(logits.view(-1, 2), labels.view(-1))
+        return loss
+
+    def train_task(self, dataloader, num_epochs, output_dir):
+        """
+        Treina a tarefa WPA e salva o estado do modelo.
+
+        Args:
+            dataloader: DataLoader contendo os embeddings dos patches de imagem.
+            num_epochs: Número de épocas para treinamento.
+            output_dir: Diretório onde o modelo será salvo.
+        """
+        self.train()
+        for epoch in range(num_epochs):
+            total_loss = 0
+            for batch in dataloader:
+                patch_embeddings = batch["patch_embeddings"].to(self.model.device)
+
+                self.optimizer.zero_grad()
+                loss = self(patch_embeddings)
+                loss.backward()
+                self.optimizer.step()
+
+                total_loss += loss.item()
+            
+            avg_loss = total_loss / len(dataloader)
+            print(f"Epoch {epoch+1}/{num_epochs}, Loss: {avg_loss:.4f}")
+
+        torch.save(self.state_dict(), f"{output_dir}/wpa_task.pth")
+        print("Treinamento concluído e modelo salvo!")
+
+class KPLTask(nn.Module):
+    def __init__(self, model, grid_size, num_classes, lr=5e-5):
+        """
+        Implementação da Key Point Location (KPL).
+
+        Args:
+            model: O modelo base (LiLTv2 ou similar).
+            grid_size: Tamanho da grade para quantização das posições.
+            num_classes: Número de regiões na grade (grid_size * grid_size).
+            lr: Taxa de aprendizado.
+        """
+        super().__init__()
+        self.model = model
+        self.grid_size = grid_size
+        self.num_classes = num_classes  # Quantidade de regiões para classificar os key points
+        self.classifier = nn.Linear(model.config.hidden_size, num_classes * 3)  # 3 key points por bounding box
+        self.optimizer = optim.AdamW(self.model.parameters(), lr=lr)
+
+    def mask_bounding_boxes(self, bounding_boxes, mask_prob=0.15):
+        """
+        Aplica máscara nos bounding boxes com estratégia similar ao MVLM.
+
+        Args:
+            bounding_boxes (torch.Tensor): Tensor de bounding boxes (B, T, 6).
+            mask_prob (float): Probabilidade de mascaramento.
+
+        Returns:
+            masked_boxes (torch.Tensor): Bounding boxes mascarados.
+            labels (torch.Tensor): Rótulos indicando as regiões dos key points.
+        """
+        batch_size, num_boxes, _ = bounding_boxes.shape
+        labels = bounding_boxes.clone()
+        device = bounding_boxes.device
+
+         # Seleciona quais bounding boxes serão mascarados
+        mask = torch.rand(batch_size, num_boxes, device=device) < mask_prob
+        masked_boxes = bounding_boxes.clone()
+
+        # 80% → Substituídos por um token especial de máscara
+        mask_token = torch.zeros_like(masked_boxes)  # Bounding box mascarado
+        masked_boxes[mask] = mask_token[mask]
+
+        # 10% → Substituídos por bounding boxes aleatórios do batch
+        random_boxes = bounding_boxes[torch.randint(0, batch_size, (batch_size, num_boxes), device=device)]
+        random_indices = torch.bernoulli(torch.full((batch_size, num_boxes), 0.10, device=device)).bool() & mask
+        masked_boxes[random_indices] = random_boxes[random_indices]
+
+        # 10% → Permanecem inalterados (já feito pela inicialização)
+
+        return masked_boxes, labels
+
+    def quantize_to_grid(self, keypoints, img_size):
+        """
+        Quantiza os key points para a grade de regiões.
+
+        Args:
+            keypoints (torch.Tensor): Tensor de coordenadas dos key points (B, T, 3, 2).
+            img_size (int): Dimensão da imagem.
+
+        Returns:
+            torch.Tensor: Índices das regiões na grade.
+        """
+        grid_step = img_size // self.grid_size  # Define o tamanho de cada célula na grade
+        indices = (keypoints // grid_step).long()  # Mapeia as coordenadas para células da grade
+        return indices[..., 0] * self.grid_size + indices[..., 1]  # Transforma em índice único
+
+    def forward(self, bounding_boxes, img_size):
+        """
+        Forward pass para predição dos key points.
+
+        Args:
+            bounding_boxes (torch.Tensor): Tensor de bounding boxes (B, T, 6).
+            img_size (int): Dimensão da imagem.
+
+        Returns:
+            loss (torch.Tensor): Perda da tarefa KPL.
+        """
+        # Aplicar a máscara
+        masked_boxes, labels = self.mask_bounding_boxes(bounding_boxes)
+
+        # Extrair features do modelo base
+        outputs = self.model(masked_boxes)  # Obtém as representações do modelo base
+
+        # Predição dos key points
+        logits = self.classifier(outputs)  # (B, T, num_classes * 3)
+
+        # Reformatar os labels dos key points
+        keypoints = labels[:, :, [0, 1, 2, 3, 4, 5]].reshape(labels.shape[0], labels.shape[1], 3, 2)  # Top-left, bottom-right, center
+        target_labels = self.quantize_to_grid(keypoints, img_size)  # Converte para índices da grade
+
+        loss = nn.CrossEntropyLoss()(logits.view(-1, self.num_classes), target_labels.view(-1))
+        return loss
+
+    def train_task(self, dataloader, num_epochs, output_dir, img_size):
+        """
+        Treina a tarefa KPL e salva o estado do modelo.
+
+        Args:
+            dataloader: DataLoader contendo os bounding boxes e dados de entrada.
+            num_epochs: Número de épocas para treinamento.
+            output_dir: Diretório onde o modelo será salvo.
+            img_size: Dimensão da imagem usada para quantização.
+        """
+        self.train()
+        for epoch in range(num_epochs):
+            total_loss = 0
+            for batch in dataloader:
+                bounding_boxes = batch["bounding_boxes"].to(self.model.device)
+
+                self.optimizer.zero_grad()
+                loss = self.forward(bounding_boxes, img_size)  # Chama a função forward explicitamente
+                loss.backward()
+                self.optimizer.step()
+
+                total_loss += loss.item()
+            
+            avg_loss = total_loss / len(dataloader)
+            print(f"Epoch {epoch+1}/{num_epochs}, Loss: {avg_loss:.4f}")
+        torch.save(self.state_dict(), f"{output_dir}/kpl_task.pth")
+        print("Treinamento concluído e modelo salvo!")
+
+class RPCTask(nn.Module): 
+    def __init__(self, model, input_dim, hidden_dim, num_directions=8, num_distances=5, lr=1e-3):
+        """
+        Implementação da Relative Position Classification (RPC).
+
+        Args:
+            model: O modelo base (LiLTv2 ou similar).
+            input_dim: Dimensão dos embeddings das caixas de texto.
+            hidden_dim: Dimensão intermediária da FFN.
+            num_directions: Número de direções para classificação (8).
+            num_distances: Número de classes para distância (ajustável).
+            lr: Taxa de aprendizado.
+        """
+        super().__init__()
+        self.model = model
+        self.ffn = nn.Sequential(
+            nn.Linear(input_dim * 2, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU()
+        )
+        self.direction_classifier = nn.Linear(hidden_dim, num_directions)
+        self.distance_classifier = nn.Linear(hidden_dim, num_distances)
+        self.optimizer = optim.AdamW(self.parameters(), lr=lr)
+
+    def forward(self, box1, box2):
+        """
+        Forward pass da tarefa RPC.
+
+        Args:
+            box1 (torch.Tensor): Representação do primeiro bounding box (B, input_dim).
+            box2 (torch.Tensor): Representação do segundo bounding box (B, input_dim).
+
+        Returns:
+            direction_logits (torch.Tensor): Logits para a classificação de direção (B, num_directions).
+            distance_logits (torch.Tensor): Logits para a classificação de distância (B, num_distances).
+        """
+        x = torch.cat((box1, box2), dim=-1)  # Concatenação das representações
+        x = self.ffn(x)  # Passa pelo FFN
+        direction_logits = self.direction_classifier(x)
+        distance_logits = self.distance_classifier(x)
+        return direction_logits, distance_logits
+
+    def train_task(self, dataloader, num_epochs, output_dir):
+        """
+        Treina a RPC e salva o estado do modelo.
+
+        Args:
+            dataloader: DataLoader contendo os pares de bounding boxes e seus rótulos.
+            num_epochs: Número de épocas para treinamento.
+            output_dir: Diretório onde o modelo será salvo.
+        """
+        self.train()
+        for epoch in range(num_epochs):
+            total_loss = 0
+            for batch in dataloader:
+                box1, box2 = batch["box1"].to(self.model.device), batch["box2"].to(self.model.device)
+                direction, distance = batch["direction"].to(self.model.device), batch["distance"].to(self.model.device)
+
+                direction = direction.long()
+                distance = distance.long()
+
+                if direction.min() < 0 or direction.max() >= self.direction_classifier.out_features:
+                    raise ValueError(f"Invalid direction labels: {direction}")
+                if distance.min() < 0 or distance.max() >= self.distance_classifier.out_features:
+                    raise ValueError(f"Invalid distance labels: {distance}")
+
+                self.optimizer.zero_grad()
+                direction_logits, distance_logits = self.forward(box1, box2)
+
+                loss = nn.CrossEntropyLoss()(direction_logits, direction) + nn.CrossEntropyLoss()(distance_logits, distance)
+                loss.backward()
+                self.optimizer.step()
+
+                total_loss += loss.item()
+            
+            avg_loss = total_loss / len(dataloader)
+            print(f"Epoch {epoch+1}/{num_epochs}, Loss: {avg_loss:.4f}")
+
+        torch.save(self.state_dict(), f"{output_dir}/rpc_task.pth")
+        print("Treinamento concluído e modelo salvo!")

@@ -59,9 +59,9 @@ if __name__ == '__main__':
     parser.add_argument('--dataset', type=str, required=True)
     parser.add_argument('--output-path', type=str, default=None)
 
-    parser.add_argument('--epochs', type=int, default=50)
-    parser.add_argument('--batch-size', type=int, default=12)
-    parser.add_argument('--learning-rate', type=float, default=5e-5)
+    parser.add_argument('--epochs', type=int, default=5)
+    parser.add_argument('--batch-size', type=int, default=256)
+    parser.add_argument('--learning-rate', type=float, default=1e-4)
     parser.add_argument('--patience', type=int, default=None)
 
     parser.add_argument('--smoke-test', action='store_true')
@@ -122,6 +122,9 @@ if __name__ == '__main__':
         per_device_eval_batch_size=args.batch_size,
         learning_rate=args.learning_rate,
         num_train_epochs=args.epochs,
+        weight_decay=0.01,
+        warmup_ratio=0.1,  
+        lr_scheduler_type="linear",
     )
 
     model.save()
@@ -129,7 +132,8 @@ if __name__ == '__main__':
     model.fit(
         dataset['train'], dataset['val'],
         max_epochs=args.epochs, learning_rate=args.learning_rate,
-        batch_size=args.batch_size, patience=args.patience
+        batch_size=args.batch_size, patience=args.patience,
+        training_args=training_args 
     )
     model.save()
 
