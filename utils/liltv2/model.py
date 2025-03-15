@@ -68,9 +68,6 @@ class CustomLiltModel(LiltForTokenClassification, nn.Module):
         keypoint_preds = self.tasks["KPL"](hidden_state)
         hidden_state += keypoint_preds.mean(dim=-1, keepdim=True)  
 
-        rpc_preds = self.tasks["RPC"](text_layout, image_layout)
-        hidden_state += rpc_preds.mean(dim=-1, keepdim=True)   
-
         alignment_scores = self.tasks["WPA"](hidden_state, image_embeds)
         hidden_state += alignment_scores.mean(dim=-1, keepdim=True)
         '''
@@ -189,7 +186,6 @@ class LiltModel:
             #'MVLM': MVLMTask(model=self.model, tokenizer=self.tokenizer, vocab_size=len(self.tokenizer)),
             #'WPA': WPATask(model=self.model, patch_size=16, img_size=224),
             'KPL': KPLTask(model=self.model, grid_size=7, num_classes=49),
-            #'RPC': RPCTask(model=self.model, input_dim=config.hidden_size, hidden_dim=256, num_directions=8, num_distances=5)
         }
 
         self.model.tasks = self.tasks

@@ -211,13 +211,8 @@ class KPLTask(nn.Module):
         labels = bounding_boxes.clone()
         device = bounding_boxes.device
 
-        print(f"bounding_boxes.shape antes de clonar: {bounding_boxes.shape}")  
-
-        # 🔹 Certifica que bounding_boxes tem shape correto (B, T, 6)
-        if bounding_boxes.shape[-1] > 6:
-            bounding_boxes = bounding_boxes[:, :, :6]
-
-        print(f"bounding_boxes.shape corrigido: {bounding_boxes.shape}")  
+        # Certifica que bounding_boxes tem shape correto (B, T, 6)
+        if bounding_boxes.shape[-1] > 6: bounding_boxes = bounding_boxes[:, :, :6]
 
         # Seleciona quais bounding boxes serão mascarados
         mask = torch.rand(batch_size, num_boxes, device=device) < mask_prob
@@ -234,7 +229,6 @@ class KPLTask(nn.Module):
         # Corrigindo random_indices para corresponder ao formato correto (B, T, 6)
         random_indices = torch.bernoulli(torch.full((batch_size, num_boxes, 1), 0.10, device=device)).bool().expand(-1, -1, 6) & mask.unsqueeze(-1)
 
-        # ✅ Usa torch.where para evitar erro de shape
         masked_boxes = torch.where(random_indices, random_boxes, masked_boxes)
 
         return masked_boxes, labels
@@ -251,10 +245,9 @@ class KPLTask(nn.Module):
         Returns:
             torch.Tensor: Índices das regiões na grade.
         """
-        grid_step = max(1, img_size // self.grid_size)  # 🔹 Evita divisão por zero
+        grid_step = max(1, img_size // self.grid_size)  
         indices = (keypoints // grid_step).long()  # Mapeia as coordenadas para células da grade
 
-        # 🔹 Garante que os índices estejam dentro do intervalo válido
         indices[..., 0] = indices[..., 0].clamp(0, self.grid_size - 1)
         indices[..., 1] = indices[..., 1].clamp(0, self.grid_size - 1)
 
@@ -276,11 +269,10 @@ class KPLTask(nn.Module):
         keypoints = labels[:, :, [0, 1, 2, 3, 4, 5]].reshape(labels.shape[0], labels.shape[1], 3, 2)
         target_labels = self.quantize_to_grid(keypoints, img_size)
 
-        # 🔹 Verifica valores inválidos antes de calcular a loss
         if (target_labels < 0).any() or (target_labels >= self.num_classes).any():
             print(f"[ERRO] target_labels contém valores fora do intervalo esperado: {target_labels}")
 
-        target_labels = target_labels.clamp(0, self.num_classes - 1)  # 🔹 Garante que os valores estejam no intervalo correto
+        target_labels = target_labels.clamp(0, self.num_classes - 1)
 
         loss = nn.CrossEntropyLoss()(logits.view(-1, self.num_classes), target_labels.view(-1))
 
