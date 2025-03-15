@@ -70,7 +70,8 @@ def load_custom_dataset(path, partitions=('train', 'val', 'test'), load_image=Fa
             'filenames': [],
             'tokens': [],
             'bboxes': [],
-            'ner_tags': []
+            'ner_tags': [],
+            'img_size': []
         }
         if load_image:
             partition_dict['image'] = []
@@ -105,6 +106,7 @@ def load_custom_dataset(path, partitions=('train', 'val', 'test'), load_image=Fa
             partition_dict['tokens'].append(doc_texts)
             partition_dict['bboxes'].append(doc_bboxes)
             partition_dict['ner_tags'].append(doc_ner_tags)
+            partition_dict['img_size'].append((w, h))
 
             if load_image:
                 image_path = os.path.join(path, 'images', doc['file_name'])

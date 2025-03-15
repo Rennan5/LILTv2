@@ -14,6 +14,7 @@ from utils.ags import *
 import numpy as np
 from datasets import (Array2D, ClassLabel, Features, Sequence, Value)
 from transformers import (LiltForTokenClassification, LayoutLMv3TokenizerFast)
+from transformers import AutoTokenizer,default_data_collator
 
 import datetime
 import os
@@ -33,10 +34,14 @@ class CustomLiltModel(LiltForTokenClassification, nn.Module):
         self.visual_embedding = visual_embedding
         self.tasks = tasks
 
-    def forward(self, input_ids, attention_mask, labels=None, images=None, visual_features=None, text_layout=None, image_layout=None, task_id=0):
+    def forward(self, input_ids, attention_mask, labels=None, images=None, visual_features=None, img_size=None, task_id=0):
         """
         Forward pass combinando DAEM e Dual-Stream Attention.
         """
+
+        image_layout = torch.zeros((1, 224, 224, 3), device=input_ids.device)
+        text_layout = torch.zeros((input_ids.shape[0], 512, 4), device=input_ids.device)
+        image_positions = torch.zeros((input_ids.shape[0], 512, 4), device=input_ids.device)
         
         encoder_outputs = super().forward(input_ids=input_ids, attention_mask=attention_mask)
         hidden_state = encoder_outputs.hidden_states[-1]  # Última camada oculta
@@ -70,20 +75,26 @@ class CustomLiltModel(LiltForTokenClassification, nn.Module):
         hidden_state += alignment_scores.mean(dim=-1, keepdim=True)
         '''
 
-        # Dual-Stream Attention
-        '''
-        TODO
+        image_size = max(img_size[0][0][0],img_size[0][0][1]) if img_size is not None else 800
 
+        keypoint_preds = self.tasks["KPL"](hidden_state,image_size,attention_mask,input_ids)
+        keypoint_preds, _ = self.tasks["KPL"](hidden_state, image_size, attention_mask, input_ids)
+        if keypoint_preds.dim() > 0: keypoint_preds = keypoint_preds.mean(dim=-1, keepdim=True)
+        hidden_state += keypoint_preds
+        
+        # Dual-Stream Attention
+        
         fused_state = self.dual_stream(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            layout_images=images,  
+            layout_images=image_layout,
+            text_positions=text_layout,  
+            image_positions=image_positions,
             task_id=task_id
         )
-        '''
-        
-        #combined_state = hidden_state + fused_state # Fusão dos embeddings
-        combined_state = hidden_state
+
+        fused_state = nn.Linear(10, 768).to(hidden_state.device)(fused_state)
+        combined_state = hidden_state + fused_state # Fusão dos embeddings
         
         logits = self.classifier(combined_state)
 
@@ -95,21 +106,19 @@ class CustomLiltModel(LiltForTokenClassification, nn.Module):
             output["loss"] = loss
 
         return output
-
-def process_lilt(dataset, labels, tokenizer,ags):
-    ## we need to define custom features
+    
+def process_lilt(dataset, labels, tokenizer, ags):
     features = Features({
-        # useful(not required) columns
         "filenames": Value(dtype="string"),
         "tokens": Sequence(feature=Value(dtype="string")),
         "word_ids": Sequence(feature=Value(dtype="int64")),
-
-        # required columns
         "input_ids": Sequence(feature=Value(dtype="int64")),
         "attention_mask": Sequence(feature=Value(dtype="int64")),
         "bbox": Array2D(dtype="int64", shape=(512, 4)),
+        "img_size": Array2D(dtype="int64", shape=(1, 2)),
         "labels": Sequence(ClassLabel(names=labels)),
     })
+
     def process(sample, tokenizer=None):
         encoding = tokenizer(
             sample["tokens"],
@@ -120,10 +129,10 @@ def process_lilt(dataset, labels, tokenizer,ags):
         )
 
         encoding['word_ids'] = encoding.word_ids()
+        encoding['img_size'] = [sample["img_size"]]
 
         return encoding
 
-    ## process the dataset and format it to pytorch
     dataset_processed = dataset.map(
         partial(process, tokenizer=tokenizer),
         remove_columns=["ner_tags", "id", "bboxes"],
@@ -141,7 +150,7 @@ class LiltModel:
         label2id = {k: v for v, k in enumerate(labels)}
 
         self.ags = AGS()
-        self.tokenizer = LayoutLMv3TokenizerFast.from_pretrained(model_id)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_id)
 
         config = LiltConfig.from_pretrained(
             model_id, 
@@ -153,6 +162,7 @@ class LiltModel:
 
         self.dual_stream = DualStreamAttentionLiLTv2(
             base_model_name="bert-base-uncased",
+            tokenizer=self.tokenizer,  # ✅ Adiciona tokenizer para garantir compatibilidade
             num_tasks=3,
             task_heads=[{"type": "classification", "output_size": 10}]
         )
@@ -176,10 +186,10 @@ class LiltModel:
         )
 
         self.tasks = {
-            'MVLM': MVLMTask(model=self.model, tokenizer=self.tokenizer, vocab_size=len(self.tokenizer)),
-            'WPA': WPATask(model=self.model, patch_size=16, img_size=224),
+            #'MVLM': MVLMTask(model=self.model, tokenizer=self.tokenizer, vocab_size=len(self.tokenizer)),
+            #'WPA': WPATask(model=self.model, patch_size=16, img_size=224),
             'KPL': KPLTask(model=self.model, grid_size=7, num_classes=49),
-            'RPC': RPCTask(model=self.model, input_dim=config.hidden_size, hidden_dim=256, num_directions=8, num_distances=5)
+            #'RPC': RPCTask(model=self.model, input_dim=config.hidden_size, hidden_dim=256, num_directions=8, num_distances=5)
         }
 
         self.model.tasks = self.tasks
@@ -215,11 +225,12 @@ class LiltModel:
         modules_to_replace = []
         for name, module in self.model.named_modules():
             if isinstance(module, torch.nn.Linear) and "dual_stream.text_encoder" in name:
-                modules_to_replace.append((name, module))
-                
+                if module.in_features in [768, 3072]:
+                    modules_to_replace.append((name, module))
+
         for name, module in modules_to_replace:
             parent_module, child_name = self.get_parent_module(name)
-            setattr(parent_module, child_name, LoRALinear(module))
+            setattr(parent_module, child_name, LoRALayer(module.in_features, module.out_features, rank=4))
 
     def fit(self, train_dataset, val_dataset, max_epochs=1, learning_rate=5e-5, batch_size=1, patience=None,training_args=None):
 
@@ -265,13 +276,13 @@ class LiltModel:
 
         train_dataset_proc = process_lilt(train_dataset, ner_labels, self.tokenizer,self.ags)
         val_dataset_proc = process_lilt(val_dataset, ner_labels, self.tokenizer,self.ags)
-
+        
         trainer = Trainer(
             model=self.model,
             args=training_args,
-            compute_metrics=compute_metrics,
             train_dataset=train_dataset_proc,
-            eval_dataset=val_dataset_proc
+            eval_dataset=val_dataset_proc,
+            compute_metrics=compute_metrics,
         )
 
         trainer.train()
