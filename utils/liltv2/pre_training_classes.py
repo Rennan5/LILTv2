@@ -9,54 +9,47 @@ from tqdm import tqdm
 
 class MVLMTask(nn.Module):
     def __init__(self, model, tokenizer, vocab_size, mask_prob=0.15, lr=5e-5):
-        """
-        Classe para treinar a Masked Visual-Language Modeling (MVLM).
-
-        Args:
-            model: O modelo LiLTv2 ou outro modelo baseado em Transformer.
-            tokenizer: Tokenizer do LayoutLMv3 ou equivalente.
-            vocab_size: Tamanho do vocabulário.
-            mask_prob: Probabilidade de mascaramento (padrão 15%).
-            lr: Taxa de aprendizado para o otimizador.
-        """
         super().__init__()
         self.model = model
         self.tokenizer = tokenizer
         self.vocab_size = vocab_size
         self.mask_prob = mask_prob
+        self.classifier = nn.Linear(model.config.hidden_size, vocab_size)  # Camada de previsão de tokens
         self.optimizer = optim.AdamW(self.model.parameters(), lr=lr)
 
     def mask_tokens(self, input_ids):
-        """
-        Aplica a máscara nos tokens de entrada, seguindo a regra 80%-10%-10%.
-        """
         device = input_ids.device
         labels = input_ids.clone()
 
         probability_matrix = torch.full(input_ids.shape, self.mask_prob, device=device)
         masked_indices = torch.bernoulli(probability_matrix).bool()
-        mask_token_id = self.tokenizer.convert_tokens_to_ids("[MASK]")
-        
+        mask_token_id = self.tokenizer.mask_token_id
+
         masked_input = input_ids.clone()
         masked_input[masked_indices] = mask_token_id
 
-        # 10% dos tokens mascarados -> substituídos por palavras aleatórias
+        # 10% dos tokens mascarados são substituídos por palavras aleatórias
         random_tokens = torch.randint(self.vocab_size, input_ids.shape, dtype=torch.long, device=device)
         random_indices = torch.bernoulli(torch.full(input_ids.shape, 0.10, device=device)).bool() & masked_indices
         masked_input[random_indices] = random_tokens[random_indices]
 
-        labels[~masked_indices] = -100  # Ignorar os tokens não mascarados
+        labels[~masked_indices] = -100  # Ignorar tokens não mascarados
         return masked_input, labels
 
     def forward(self, input_ids, attention_mask):
         """
-        Executa um forward pass com a MVLM.
+        Executa um forward pass na MVLM e retorna logits e loss.
         """
         masked_input, labels = self.mask_tokens(input_ids)
-        outputs = self.model(masked_input, attention_mask=attention_mask)
-        logits = outputs.logits  # Saída do modelo
+
+        with torch.no_grad():  # Evita computação desnecessária para gradientes
+            outputs = self.model.base_model(input_ids=masked_input, attention_mask=attention_mask).last_hidden_state
+        self.classifier.to(outputs.device)  # Certifica que está no mesmo dispositivo
+        logits = self.classifier(outputs)  # (B, T, vocab_size)
+
         loss = nn.CrossEntropyLoss(ignore_index=-100)(logits.view(-1, self.vocab_size), labels.view(-1))
-        return loss
+
+        return logits, loss
 
     def train_task(self, dataloader, num_epochs, output_dir):
         """
@@ -144,9 +137,13 @@ class WPATask(nn.Module):
         Returns:
             loss (torch.Tensor): Perda da tarefa WPA.
         """
+        device = patch_embeddings.device  # Obtém o dispositivo do tensor de entrada
+        self.classifier = self.classifier.to(device)  # Move a camada para o mesmo dispositivo
         masked_patches, labels = self.mask_patches(patch_embeddings)
-        logits = self.classifier(masked_patches)
+
+        logits = self.classifier(masked_patches.to(device))  # Garante que o input está no mesmo device
         loss = nn.CrossEntropyLoss()(logits.view(-1, 2), labels.view(-1))
+
         return loss
 
     def train_task(self, dataloader, num_epochs, output_dir):

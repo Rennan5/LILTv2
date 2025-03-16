@@ -12,9 +12,12 @@ from utils.dual_stream_arch import *
 from utils.ags import *
 
 import numpy as np
-from datasets import (Array2D, ClassLabel, Features, Sequence, Value)
+from datasets import (Array2D, ClassLabel, Features, Sequence, Value) 
 from transformers import (LiltForTokenClassification, LayoutLMv3TokenizerFast)
 from transformers import AutoTokenizer,default_data_collator
+from torchvision import transforms
+from PIL import Image
+import io
 
 import datetime
 import os
@@ -38,8 +41,8 @@ class CustomLiltModel(LiltForTokenClassification, nn.Module):
         """
         Forward pass combinando DAEM e Dual-Stream Attention.
         """
-
-        image_layout = torch.zeros((1, 224, 224, 3), device=input_ids.device)
+        image_size = max(img_size[0][0][0],img_size[0][0][1]) if img_size is not None else 800
+        image_layout = torch.zeros((1, image_size, image_size, 3), device=input_ids.device)
         text_layout = torch.zeros((input_ids.shape[0], 512, 4), device=input_ids.device)
         image_positions = torch.zeros((input_ids.shape[0], 512, 4), device=input_ids.device)
         
@@ -47,40 +50,30 @@ class CustomLiltModel(LiltForTokenClassification, nn.Module):
         hidden_state = encoder_outputs.hidden_states[-1]  # Última camada oculta
 
         image_embeds = self.patch_embedding(images) if images is not None else None
-
+        
         if visual_features is not None:
             visual_embeds = self.visual_embedding(visual_features)
             hidden_state += visual_embeds  # Incorporando informações visuais no texto
-
+        
         if image_embeds is not None and text_layout is not None and image_layout is not None:
             hidden_state, _ = self.daem(hidden_state, image_embeds, text_layout, image_layout)
 
-        '''
-        TODO
-
-        masked_indices = (input_ids == self.tokenizer.mask_token_id)
-        mvlm_preds = self.tasks["MVLM"](text_tokens=input_ids, layout_boxes=text_layout, image_features=image_embeds, masked_indices=masked_indices)
+        mvlm_logits, _ = self.tasks["MVLM"](input_ids, attention_mask)
         
-        if mvlm_preds.numel() > 0:
-            mvlm_preds_mean = mvlm_preds.mean(dim=-1, keepdim=True)
-            hidden_state += mvlm_preds_mean.expand_as(hidden_state).to(hidden_state.device)
-
-        keypoint_preds = self.tasks["KPL"](hidden_state)
-        hidden_state += keypoint_preds.mean(dim=-1, keepdim=True)  
-
-        alignment_scores = self.tasks["WPA"](hidden_state, image_embeds)
-        hidden_state += alignment_scores.mean(dim=-1, keepdim=True)
-        '''
-
-        image_size = max(img_size[0][0][0],img_size[0][0][1]) if img_size is not None else 800
-
+        mvlm_embeddings = mvlm_logits.mean(dim=-1, keepdim=True)  # Obtém média ao longo da dimensão de logits
+        hidden_state += mvlm_embeddings.expand_as(hidden_state).to(hidden_state.device)
+        
         keypoint_preds = self.tasks["KPL"](hidden_state,image_size,attention_mask,input_ids)
         keypoint_preds, _ = self.tasks["KPL"](hidden_state, image_size, attention_mask, input_ids)
         if keypoint_preds.dim() > 0: keypoint_preds = keypoint_preds.mean(dim=-1, keepdim=True)
         hidden_state += keypoint_preds
         
-        # Dual-Stream Attention
+        if image_embeds is not None:
+            alignment_scores = self.tasks["WPA"](image_embeds)
+            if alignment_scores.dim() > 0: alignment_scores = alignment_scores.mean(dim=-1, keepdim=True)
+            hidden_state += alignment_scores.mean(dim=-1, keepdim=True)
         
+        # Dual-Stream Attention
         fused_state = self.dual_stream(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -92,7 +85,7 @@ class CustomLiltModel(LiltForTokenClassification, nn.Module):
 
         fused_state = nn.Linear(10, 768).to(hidden_state.device)(fused_state)
         combined_state = hidden_state + fused_state # Fusão dos embeddings
-        
+
         logits = self.classifier(combined_state)
 
         output = {"logits": logits}
@@ -113,6 +106,7 @@ def process_lilt(dataset, labels, tokenizer, ags):
         "attention_mask": Sequence(feature=Value(dtype="int64")),
         "bbox": Array2D(dtype="int64", shape=(512, 4)),
         "img_size": Array2D(dtype="int64", shape=(1, 2)),
+        "image_path": Value(dtype="string"), 
         "labels": Sequence(ClassLabel(names=labels)),
     })
 
@@ -127,6 +121,7 @@ def process_lilt(dataset, labels, tokenizer, ags):
 
         encoding['word_ids'] = encoding.word_ids()
         encoding['img_size'] = [sample["img_size"]]
+        encoding['image_path'] = sample["image_path"]  
 
         return encoding
 
@@ -159,7 +154,7 @@ class LiltModel:
 
         self.dual_stream = DualStreamAttentionLiLTv2(
             base_model_name="bert-base-uncased",
-            tokenizer=self.tokenizer,  # ✅ Adiciona tokenizer para garantir compatibilidade
+            tokenizer=self.tokenizer,  
             num_tasks=3,
             task_heads=[{"type": "classification", "output_size": 10}]
         )
@@ -183,8 +178,8 @@ class LiltModel:
         )
 
         self.tasks = {
-            #'MVLM': MVLMTask(model=self.model, tokenizer=self.tokenizer, vocab_size=len(self.tokenizer)),
-            #'WPA': WPATask(model=self.model, patch_size=16, img_size=224),
+            'MVLM': MVLMTask(model=self.model, tokenizer=self.tokenizer, vocab_size=len(self.tokenizer)),
+            'WPA': WPATask(model=self.model, patch_size=16, img_size=224),
             'KPL': KPLTask(model=self.model, grid_size=7, num_classes=49),
         }
 
@@ -247,6 +242,11 @@ class LiltModel:
         ner_labels = list(self.model.config.id2label.values())
         metric = evaluate.load("seqeval")
 
+        transform = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+        ])
+
         """
         for task_name, task in self.tasks.items():
             print(f"Treinando {task_name}...")
@@ -269,9 +269,21 @@ class LiltModel:
                     all_predictions.append(ner_labels[predicted_idx])
                     all_labels.append(ner_labels[label_idx])
             return metric.compute(predictions=[all_predictions], references=[all_labels])
-
-        train_dataset_proc = process_lilt(train_dataset, ner_labels, self.tokenizer,self.ags)
+        
         val_dataset_proc = process_lilt(val_dataset, ner_labels, self.tokenizer,self.ags)
+        train_dataset_proc = process_lilt(train_dataset, ner_labels, self.tokenizer,self.ags)
+        i = 1
+        def load_images(dataset,i):
+            images = []
+            for image_path in dataset["image_path"]:
+                if i%100 == 0: print(i)
+                i += 1
+                img = Image.open(image_path).convert("RGB")
+                img = transform(img)  
+                images.append(img.tolist())
+            return images
+
+        train_images = load_images(train_dataset_proc,i)
         
         trainer = Trainer(
             model=self.model,
@@ -279,6 +291,13 @@ class LiltModel:
             train_dataset=train_dataset_proc,
             eval_dataset=val_dataset_proc,
             compute_metrics=compute_metrics,
+            data_collator=lambda data: {
+                "input_ids": torch.stack([torch.tensor(f["input_ids"]) for f in data]),
+                "attention_mask": torch.stack([torch.tensor(f["attention_mask"]) for f in data]),
+                "labels": torch.stack([torch.tensor(f["labels"]) for f in data]),
+                "images": torch.stack([torch.tensor(train_images[i]) for i in range(len(data))]),
+                "img_size": torch.stack([torch.tensor(f["img_size"]) for f in data])
+            }
         )
 
         trainer.train()

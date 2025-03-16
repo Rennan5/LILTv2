@@ -4,6 +4,7 @@ import torch.nn as nn
 class DAEM(nn.Module):
     def __init__(self, d_model, n_heads, ff_dim, n_layers, dropout=0.1):
         super(DAEM, self).__init__()
+        self.layout_proj = nn.Linear(4, d_model)
         self.layers = nn.ModuleList([
             DAEMLayer(d_model, n_heads, ff_dim, dropout)
             for _ in range(n_layers)
@@ -11,26 +12,24 @@ class DAEM(nn.Module):
 
     def forward(self, text_embeds, image_embeds, text_layout, image_layout):
         """
-        Forward pass through DAEM layers.
-
-        Args:
-            text_embeds: Text embeddings (B, T, d_model)
-            image_embeds: Image embeddings (B, I, d_model)
-            text_layout: Text layout embeddings (B, T, d_model)
-            image_layout: Image layout embeddings (B, I, d_model)
-
-        Returns:
-            Updated text and image embeddings.
+        Forward pass do DAEM.
         """
-        # Combine embeddings with layout information
-        text_input = text_embeds + text_layout
-        image_input = image_embeds + image_layout
+        image_layout = image_layout[:, :image_embeds.shape[1], :]
+        if image_layout.shape[-1] == 3:
+            dummy_feature = torch.zeros((*image_layout.shape[:-1], 1), device=image_layout.device)  
+            image_layout = torch.cat([image_layout, dummy_feature], dim=-1)  
+        image_layout = image_layout[:, :, 0, :]
+        
+        text_layout_proj = self.layout_proj(text_layout)  
+        image_layout_proj = self.layout_proj(image_layout)  
+
+        text_input = text_embeds + text_layout_proj
+        image_input = image_embeds + image_layout_proj
 
         for layer in self.layers:
             text_input, image_input = layer(text_input, image_input)
 
         return text_input, image_input
-
 
 class DAEMLayer(nn.Module):
     def __init__(self, d_model, n_heads, ff_dim, dropout=0.1):

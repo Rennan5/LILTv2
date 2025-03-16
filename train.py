@@ -92,7 +92,7 @@ if __name__ == '__main__':
         )
     else:
         dataset, labels = load_custom_dataset(
-            f'dataset/{ args.dataset }/', load_image=load_image, smoke_test=args.smoke_test, bbox_scale=bbox_scale
+            f'dataset/{ args.dataset }/', smoke_test=args.smoke_test, bbox_scale=bbox_scale
         )
 
     id2label = {v: k for v, k in enumerate(labels)}

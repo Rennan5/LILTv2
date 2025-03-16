@@ -7,7 +7,6 @@ from pdf2image import convert_from_path
 from datasets import DatasetDict, Dataset
 import json
 
-
 def __get_dimensions__(bboxes):
     min_w, min_h = sys.maxsize, sys.maxsize
     max_w, max_h = 0, 0
@@ -60,8 +59,7 @@ def get_labels(path: str, encoding='utf8'):
 
     return class_list
 
-
-def load_custom_dataset(path, partitions=('train', 'val', 'test'), load_image=False, smoke_test=False, bbox_scale=1):
+def load_custom_dataset(path, partitions=('train', 'val', 'test'), smoke_test=False, bbox_scale=1):
     dataset_dict = {}
 
     for partition in partitions:
@@ -71,12 +69,11 @@ def load_custom_dataset(path, partitions=('train', 'val', 'test'), load_image=Fa
             'tokens': [],
             'bboxes': [],
             'ner_tags': [],
-            'img_size': []
+            'img_size': [],
+            'image_path': []
         }
-        if load_image:
-            partition_dict['image'] = []
 
-        with open(os.path.join(path, f'{ partition }.txt')) as f:
+        with open(os.path.join(path, f'{partition}.txt')) as f:
             partition_docs = [json.loads(line) for line in f.readlines()]
 
         if smoke_test:
@@ -85,9 +82,9 @@ def load_custom_dataset(path, partitions=('train', 'val', 'test'), load_image=Fa
         for doc_i, doc in enumerate(partition_docs):
             doc_texts, doc_bboxes, doc_ner_tags = [], [], []
             w, h = doc['width'], doc['height']
+
             for word in doc['annotations']:
                 doc_texts.append(word['text'])
-                # TODO: validar processamento de bbox
 
                 x0 = bbox_scale * min(word['box'][::2]) / w
                 y0 = bbox_scale * min(word['box'][1::2]) / h
@@ -106,20 +103,14 @@ def load_custom_dataset(path, partitions=('train', 'val', 'test'), load_image=Fa
             partition_dict['tokens'].append(doc_texts)
             partition_dict['bboxes'].append(doc_bboxes)
             partition_dict['ner_tags'].append(doc_ner_tags)
-            partition_dict['img_size'].append((w, h))
-
-            if load_image:
-                image_path = os.path.join(path, 'images', doc['file_name'])
-                partition_dict['image'].append(
-                    Image.open(os.path.join(image_path)).convert("RGB")
-                    if not image_path.lower().endswith(('.pdf')) else
-                    convert_from_path(os.path.join('dataset', image_path))[0].convert("RGB")
-                )
+            partition_dict['img_size'].append([w, h])
+            
+            image_path = os.path.abspath(os.path.join(path, "images", doc["file_name"]))
+            partition_dict["image_path"].append(image_path)  
 
         dataset_dict[partition] = Dataset.from_dict(partition_dict)
 
     return DatasetDict(dataset_dict), get_labels(path)
-
 
 def load_cord_dataset(path='dataset/cord/', partitions=('train', 'val', 'test'), load_image=False, smoke_test=False, bbox_scale=1):
     dataset_dict = {}
