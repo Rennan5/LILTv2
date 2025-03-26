@@ -12,7 +12,7 @@ from utils.dual_stream_arch import *
 from utils.ags import *
 
 import numpy as np
-from datasets import (Array2D, ClassLabel, Features, Sequence, Value) 
+from datasets import (Array2D, ClassLabel, Features, Sequence, Value,Array4D) 
 from transformers import (LiltForTokenClassification, LayoutLMv3TokenizerFast)
 from transformers import AutoTokenizer,default_data_collator
 from torchvision import transforms
@@ -39,57 +39,27 @@ class CustomLiltModel(LiltForTokenClassification, nn.Module):
 
     def forward(self, input_ids, attention_mask, labels=None, images=None, visual_features=None, img_size=None, task_id=0):
         """
-        Forward pass combinando DAEM e Dual-Stream Attention.
+        Forward pass combinando DAEM e Dual-Stream Attention para inferência.
         """
-        image_size = max(img_size[0][0][0],img_size[0][0][1]) if img_size is not None else 800
+        image_size = max(img_size[0][0][0], img_size[0][0][1]) if img_size is not None else 800
         image_layout = torch.zeros((1, image_size, image_size, 3), device=input_ids.device)
         text_layout = torch.zeros((input_ids.shape[0], 512, 4), device=input_ids.device)
-        image_positions = torch.zeros((input_ids.shape[0], 512, 4), device=input_ids.device)
-        
         encoder_outputs = super().forward(input_ids=input_ids, attention_mask=attention_mask)
-        hidden_state = encoder_outputs.hidden_states[-1]  # Última camada oculta
-
+        hidden_state = encoder_outputs.hidden_states[-1]  
         image_embeds = self.patch_embedding(images) if images is not None else None
         
         if visual_features is not None:
             visual_embeds = self.visual_embedding(visual_features)
-            hidden_state += visual_embeds  # Incorporando informações visuais no texto
-        
-        if image_embeds is not None and text_layout is not None and image_layout is not None:
+            hidden_state += visual_embeds  
+
+        # Aplicação do DAEM para fusão dos embeddings textuais e visuais
+        if image_embeds is not None:
             hidden_state, _ = self.daem(hidden_state, image_embeds, text_layout, image_layout)
 
-        mvlm_logits, _ = self.tasks["MVLM"](input_ids, attention_mask)
-        
-        mvlm_embeddings = mvlm_logits.mean(dim=-1, keepdim=True)  # Obtém média ao longo da dimensão de logits
-        hidden_state += mvlm_embeddings.expand_as(hidden_state).to(hidden_state.device)
-        
-        keypoint_preds = self.tasks["KPL"](hidden_state,image_size,attention_mask,input_ids)
-        keypoint_preds, _ = self.tasks["KPL"](hidden_state, image_size, attention_mask, input_ids)
-        if keypoint_preds.dim() > 0: keypoint_preds = keypoint_preds.mean(dim=-1, keepdim=True)
-        hidden_state += keypoint_preds
-        
-        if image_embeds is not None:
-            alignment_scores = self.tasks["WPA"](image_embeds)
-            if alignment_scores.dim() > 0: alignment_scores = alignment_scores.mean(dim=-1, keepdim=True)
-            hidden_state += alignment_scores.mean(dim=-1, keepdim=True)
-        
-        # Dual-Stream Attention
-        fused_state = self.dual_stream(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            layout_images=image_layout,
-            text_positions=text_layout,  
-            image_positions=image_positions,
-            task_id=task_id
-        )
-
-        fused_state = nn.Linear(10, 768).to(hidden_state.device)(fused_state)
-        combined_state = hidden_state + fused_state # Fusão dos embeddings
-
-        logits = self.classifier(combined_state)
+        # Camada final de classificação
+        logits = self.classifier(hidden_state)
 
         output = {"logits": logits}
-
         if labels is not None:
             loss_fn = nn.CrossEntropyLoss()
             loss = loss_fn(logits.view(-1, self.config.num_labels), labels.view(-1))
@@ -97,7 +67,7 @@ class CustomLiltModel(LiltForTokenClassification, nn.Module):
 
         return output
     
-def process_lilt(dataset, labels, tokenizer, ags):
+def process_lilt(dataset, labels, tokenizer, ags, model):
     features = Features({
         "filenames": Value(dtype="string"),
         "tokens": Sequence(feature=Value(dtype="string")),
@@ -108,9 +78,15 @@ def process_lilt(dataset, labels, tokenizer, ags):
         "img_size": Array2D(dtype="int64", shape=(1, 2)),
         "image_path": Value(dtype="string"), 
         "labels": Sequence(ClassLabel(names=labels)),
+        "patch_embeddings": Array4D(dtype="float32", shape=(1,1, 49, 768)) # <-- Adicionando embeddings dos patches
     })
 
-    def process(sample, tokenizer=None):
+    transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+    ])
+
+    def process(sample, tokenizer=None, model=None):
         encoding = tokenizer(
             sample["tokens"],
             boxes=ags.adaptive_gap_aware_sorting(sample["bboxes"]),
@@ -121,12 +97,22 @@ def process_lilt(dataset, labels, tokenizer, ags):
 
         encoding['word_ids'] = encoding.word_ids()
         encoding['img_size'] = [sample["img_size"]]
-        encoding['image_path'] = sample["image_path"]  
+        encoding['image_path'] = sample["image_path"]
 
+        # Carregar imagem e extrair patches
+        image = Image.open(sample["image_path"]).convert("RGB")
+        image = transform(image).unsqueeze(0)  # Adiciona batch dimension
+        with torch.no_grad():
+            patch_embeddings = model.patch_embedding(image).squeeze(0).cpu().numpy()
+        patch_embeddings = patch_embeddings.reshape(1, 196, 768)
+        patch_embeddings = patch_embeddings[:, :49, :]  # Mantém apenas os primeiros 49 patches
+        patch_embeddings = patch_embeddings.reshape(1, 1, 49, 768)  # Ajusta para a forma esperada
+
+        encoding["patch_embeddings"] = patch_embeddings
         return encoding
 
     dataset_processed = dataset.map(
-        partial(process, tokenizer=tokenizer),
+        partial(process, tokenizer=tokenizer, model=model),
         remove_columns=["ner_tags", "id", "bboxes"],
         features=features,
     ).with_format("torch")
@@ -185,12 +171,6 @@ class LiltModel:
 
         self.model.tasks = self.tasks
         
-        '''
-        TODO
-
-        Adicionar treinamento das tasks (chamar train_task para cada task de self.tasks)
-        '''
-
         self.apply_lora()
 
     def get_parent_module(self, module_name):
@@ -224,21 +204,7 @@ class LiltModel:
             setattr(parent_module, child_name, LoRALayer(module.in_features, module.out_features, rank=4))
 
     def fit(self, train_dataset, val_dataset, max_epochs=1, learning_rate=5e-5, batch_size=1, patience=None,training_args=None):
-
-        if training_args is None:
-            training_args = TrainingArguments(
-                output_dir=os.path.join(self.repository_id, 'checkpoints'),
-                evaluation_strategy="epoch",
-                save_strategy="epoch",
-                per_device_train_batch_size=batch_size,
-                per_device_eval_batch_size=batch_size,
-                learning_rate=learning_rate,
-                num_train_epochs=max_epochs,
-                weight_decay=0.01,
-                warmup_ratio=0.1,
-                lr_scheduler_type="linear",
-            )
-
+        
         ner_labels = list(self.model.config.id2label.values())
         metric = evaluate.load("seqeval")
 
@@ -247,15 +213,6 @@ class LiltModel:
             transforms.ToTensor(),
         ])
 
-        """
-        for task_name, task in self.tasks.items():
-            print(f"Treinando {task_name}...")
-            task.train_task(train_dataset, val_dataset, training_args)
-
-            task_weights_path = f"{training_args.output_dir}/{task_name.lower()}_task.pth"
-            print(f"Carregando pesos de {task_name}...")
-            task.load_state_dict(torch.load(task_weights_path, map_location="cuda" if torch.cuda.is_available() else "cpu"))
-        """
         def compute_metrics(p):
             predictions, labels = p
             predictions = np.argmax(predictions, axis=2)
@@ -268,10 +225,55 @@ class LiltModel:
                         continue
                     all_predictions.append(ner_labels[predicted_idx])
                     all_labels.append(ner_labels[label_idx])
+            
             return metric.compute(predictions=[all_predictions], references=[all_labels])
         
-        val_dataset_proc = process_lilt(val_dataset, ner_labels, self.tokenizer,self.ags)
-        train_dataset_proc = process_lilt(train_dataset, ner_labels, self.tokenizer,self.ags)
+        val_dataset_proc = process_lilt(val_dataset, ner_labels, self.tokenizer,self.ags,self.model)
+        train_dataset_proc = process_lilt(train_dataset, ner_labels, self.tokenizer,self.ags,self.model)
+        
+        data_collator = DataCollatorForTokenClassification(tokenizer=self.tokenizer, padding=True)
+        
+        # Criando DataLoader para MVLM
+        train_dataset_mvlm = train_dataset_proc.remove_columns(["filenames", "tokens", "word_ids", "bbox", "img_size", "image_path"])
+        train_dataset_mvlm.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
+
+        train_dataloader_mvlm = DataLoader(
+            train_dataset_mvlm, batch_size=8, shuffle=True, collate_fn=data_collator
+        )
+        
+        # Criando DataLoader para WPA (pegando apenas embeddings de patches)
+        train_dataset_wpa = train_dataset_proc.remove_columns(["filenames", "tokens", "word_ids", "bbox", "img_size", "image_path", "labels"])
+        train_dataset_wpa.set_format(type="torch", columns=["patch_embeddings"])
+
+        train_dataloader_wpa = DataLoader(
+            train_dataset_wpa, batch_size=8, shuffle=True
+        )
+
+        train_dataset_kpl = train_dataset_proc.remove_columns(["filenames", "tokens", "image_path"]) 
+
+        data_collator_kpl = DataCollatorForTokenClassification(
+            tokenizer=self.tokenizer, padding=True
+        )
+
+        train_dataloader_kpl = DataLoader(
+            train_dataset_kpl, batch_size=8, shuffle=True, collate_fn=data_collator_kpl
+        )
+        
+        if "MVLM" in self.tasks:
+            print("Treinando MVLM...")
+            self.tasks["MVLM"].train_task(train_dataloader_mvlm, 10, "mvlm_checkpoint")
+            self.model.save_pretrained("mvlm_checkpoint/final")  # Salva o modelo após MVLM
+
+        if "WPA" in self.tasks:
+            print("Treinando WPA...")
+            self.tasks["WPA"].train_task(train_dataloader_wpa, 100, "wpa_checkpoint")
+            self.model.save_pretrained("wpa_checkpoint/final")  # Salva o modelo após WPA
+
+        if "KPL" in self.tasks:
+            print("Treinando KPL...")
+            self.tasks["KPL"].train_task(train_dataloader_kpl, 10, "kpl_checkpoint")
+            self.model.save_pretrained("kpl_checkpoint/final")
+        
         i = 1
         def load_images(dataset,i):
             images = []
@@ -280,7 +282,7 @@ class LiltModel:
                 i += 1
                 img = Image.open(image_path).convert("RGB")
                 img = transform(img)  
-                images.append(img.tolist())
+                images.append(img) 
             return images
 
         train_images = load_images(train_dataset_proc,i)
@@ -292,11 +294,11 @@ class LiltModel:
             eval_dataset=val_dataset_proc,
             compute_metrics=compute_metrics,
             data_collator=lambda data: {
-                "input_ids": torch.stack([torch.tensor(f["input_ids"]) for f in data]),
-                "attention_mask": torch.stack([torch.tensor(f["attention_mask"]) for f in data]),
-                "labels": torch.stack([torch.tensor(f["labels"]) for f in data]),
-                "images": torch.stack([torch.tensor(train_images[i]) for i in range(len(data))]),
-                "img_size": torch.stack([torch.tensor(f["img_size"]) for f in data])
+                "input_ids": torch.stack([torch.as_tensor(f["input_ids"]) for f in data]),
+                "attention_mask": torch.stack([torch.as_tensor(f["attention_mask"]) for f in data]),
+                "labels": torch.stack([torch.as_tensor(f["labels"]) for f in data]),
+                "images": torch.stack([train_images[i] for i in range(len(data))]),
+                "img_size": torch.stack([torch.as_tensor(f["img_size"]) for f in data])
             }
         )
 

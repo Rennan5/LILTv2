@@ -35,10 +35,19 @@ def get_hyperparams_possibilities(number_of_possibilities):
     hyperparams_possibilities = []
 
     for _ in range(number_of_possibilities):
+        '''
         hyperparams_possibility = {
             "epochs": random.choice([100, 200]),
             # "epochs": random.choice([2]),
             "learning_rate": get_random_lr(),
+            "batch_size": random.choice([2, 4]),
+            "patience": 5,
+        }
+        '''
+        hyperparams_possibility = {
+            "epochs": random.choice([100, 200]),
+            # "epochs": random.choice([2]),
+            "learning_rate": 1e-4,
             "batch_size": random.choice([2, 4]),
             "patience": 5,
         }

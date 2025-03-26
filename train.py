@@ -115,9 +115,13 @@ if __name__ == '__main__':
         raise Exception
 
     training_args = TrainingArguments(
-        output_dir=os.path.join(repository_id, 'pretrain_checkpoints'),
+        output_dir=os.path.join(repository_id, 'checkpoints'),
+        logging_dir=f"{repository_id}/logs", 
+        logging_strategy="steps",
+        logging_steps=20000,
         evaluation_strategy="epoch",
         save_strategy="epoch",
+        save_total_limit=1,
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.batch_size,
         learning_rate=args.learning_rate,

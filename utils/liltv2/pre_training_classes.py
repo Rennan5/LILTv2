@@ -4,6 +4,9 @@ import torch.optim as optim
 import torch.nn.functional as F
 from transformers import Trainer,get_scheduler
 from torch.utils.data import DataLoader
+from transformers import DataCollatorForTokenClassification
+from transformers import get_scheduler
+import os
 import torch.optim as optim
 from tqdm import tqdm
 
@@ -15,7 +18,10 @@ class MVLMTask(nn.Module):
         self.vocab_size = vocab_size
         self.mask_prob = mask_prob
         self.classifier = nn.Linear(model.config.hidden_size, vocab_size)  # Camada de previsão de tokens
-        self.optimizer = optim.AdamW(self.model.parameters(), lr=lr)
+        self.optimizer = optim.AdamW(
+            list(self.model.parameters()) + list(self.classifier.parameters()),
+            lr=1e-4
+        )
 
     def mask_tokens(self, input_ids):
         device = input_ids.device
@@ -52,27 +58,37 @@ class MVLMTask(nn.Module):
         return logits, loss
 
     def train_task(self, dataloader, num_epochs, output_dir):
-        """
-        Treina a MVLM e salva o estado do modelo.
-        """
-        self.train()
+        device = next(self.model.parameters()).device
+        self.model.train()
+
         for epoch in range(num_epochs):
             total_loss = 0
+            print(len(dataloader))
+            i = 0
             for batch in dataloader:
-                input_ids, attention_mask = batch["input_ids"].to(self.model.device), batch["attention_mask"].to(self.model.device)
-                
+                i += 1
+                if i % 5 == 0: print(i)
                 self.optimizer.zero_grad()
-                loss = self(input_ids, attention_mask)
+                
+                # Passando labels corretamente para o modelo
+                _, loss = self.forward(
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"]
+                )
+
                 loss.backward()
                 self.optimizer.step()
-                
-                total_loss += loss.item()
-            
-            avg_loss = total_loss / len(dataloader)
-            print(f"Epoch {epoch+1}/{num_epochs}, Loss: {avg_loss:.4f}")
 
-        torch.save(self.state_dict(), f"{output_dir}/mvlm_task.pth")
-        print("Treinamento concluído e modelo salvo!")
+                total_loss += loss.item()
+
+            avg_loss = total_loss / len(dataloader)
+            print(f"Época {epoch + 1}/{num_epochs} - Loss: {avg_loss:.4f}")
+
+        # Salvar modelo treinado
+        os.makedirs(output_dir, exist_ok=True)
+        model_path = os.path.join(output_dir, "mvlm_model.pth")
+        torch.save(self.model.state_dict(), model_path)
+        print(f"Modelo salvo em {model_path}")
 
 class WPATask(nn.Module):
     def __init__(self, model, patch_size, img_size, lr=5e-5):
@@ -91,7 +107,10 @@ class WPATask(nn.Module):
         self.img_size = img_size
         self.num_patches = (img_size // patch_size) ** 2
         self.classifier = nn.Linear(model.config.hidden_size, 2)  # Binário: mascarado ou não
-        self.optimizer = optim.AdamW(self.model.parameters(), lr=lr)
+        self.optimizer = optim.AdamW(
+            list(self.model.parameters()) + list(self.classifier.parameters()),
+            lr=1e-4
+        )
 
     def mask_patches(self, patch_embeddings, mask_prob=0.15):
         """
@@ -105,6 +124,7 @@ class WPATask(nn.Module):
             masked_patches (torch.Tensor): Patches mascarados.
             labels (torch.Tensor): Rótulos indicando quais patches foram mascarados.
         """
+        patch_embeddings = patch_embeddings.squeeze(1).squeeze(1)
         batch_size, num_patches, hidden_dim = patch_embeddings.shape
         labels = torch.zeros(batch_size, num_patches, dtype=torch.long, device=patch_embeddings.device)
         
@@ -148,31 +168,36 @@ class WPATask(nn.Module):
 
     def train_task(self, dataloader, num_epochs, output_dir):
         """
-        Treina a tarefa WPA e salva o estado do modelo.
+        Treina a task WPA (Word-Patch Alignment).
 
         Args:
-            dataloader: DataLoader contendo os embeddings dos patches de imagem.
-            num_epochs: Número de épocas para treinamento.
-            output_dir: Diretório onde o modelo será salvo.
+            dataloader: DataLoader contendo os embeddings dos patches da imagem.
+            num_epochs: Número de épocas de treinamento.
+            output_dir: Diretório onde o modelo treinado será salvo.
         """
-        self.train()
+        device = next(self.model.parameters()).device
+        self.model.train()
+            
         for epoch in range(num_epochs):
             total_loss = 0
             for batch in dataloader:
-                patch_embeddings = batch["patch_embeddings"].to(self.model.device)
-
+                patch_embeddings = batch["patch_embeddings"].to(device)  # Garante que está no dispositivo certo
+                
                 self.optimizer.zero_grad()
-                loss = self(patch_embeddings)
+                loss = self.forward(patch_embeddings)  # Calcula a perda
                 loss.backward()
                 self.optimizer.step()
 
                 total_loss += loss.item()
-            
-            avg_loss = total_loss / len(dataloader)
-            print(f"Epoch {epoch+1}/{num_epochs}, Loss: {avg_loss:.4f}")
 
-        torch.save(self.state_dict(), f"{output_dir}/wpa_task.pth")
-        print("Treinamento concluído e modelo salvo!")
+            avg_loss = total_loss / len(dataloader)
+            print(f"Época {epoch + 1}/{num_epochs} - Loss WPA: {avg_loss:.4f}")
+
+        # Salvar modelo treinado
+        os.makedirs(output_dir, exist_ok=True)
+        model_path = os.path.join(output_dir, "wpa_model.pth")
+        torch.save(self.model.state_dict(), model_path)
+        print(f"Modelo WPA salvo em {model_path}")
 
 class KPLTask(nn.Module):
     def __init__(self, model, grid_size, num_classes, lr=5e-5):
@@ -190,7 +215,10 @@ class KPLTask(nn.Module):
         self.grid_size = grid_size
         self.num_classes = num_classes  # Quantidade de regiões para classificar os key points
         self.classifier = nn.Linear(model.config.hidden_size, num_classes * 3)  # 3 key points por bounding box
-        self.optimizer = optim.AdamW(self.model.parameters(), lr=lr)
+        self.optimizer = optim.AdamW(
+            list(self.model.parameters()) + list(self.classifier.parameters()),
+            lr=1e-4
+        )
 
     def mask_bounding_boxes(self, bounding_boxes, mask_prob=0.15):
         """
@@ -204,9 +232,13 @@ class KPLTask(nn.Module):
             masked_boxes (torch.Tensor): Bounding boxes mascarados.
             labels (torch.Tensor): Rótulos indicando as regiões dos key points.
         """
-        batch_size, num_boxes, _ = bounding_boxes.shape
+        batch_size, num_boxes, num_features = bounding_boxes.shape
         labels = bounding_boxes.clone()
         device = bounding_boxes.device
+
+        if num_features < 6:
+            padding = torch.zeros((batch_size, num_boxes, 6 - num_features), device=device)
+            bounding_boxes = torch.cat([bounding_boxes, padding], dim=-1)
 
         # Certifica que bounding_boxes tem shape correto (B, T, 6)
         if bounding_boxes.shape[-1] > 6: bounding_boxes = bounding_boxes[:, :, :6]
@@ -220,8 +252,8 @@ class KPLTask(nn.Module):
         masked_boxes[mask] = mask_token[mask]
 
         # 10% → Substituídos por bounding boxes aleatórios do batch
-        random_indices = torch.randint(0, batch_size, (batch_size,), device=device).unsqueeze(-1).unsqueeze(-1)
-        random_boxes = bounding_boxes[random_indices, :, :]
+        random_indices = torch.randint(0, batch_size, (batch_size, num_boxes, 1), device=device).expand(-1, -1, 6)  
+        random_boxes = torch.gather(bounding_boxes, dim=0, index=random_indices)
 
         # Corrigindo random_indices para corresponder ao formato correto (B, T, 6)
         random_indices = torch.bernoulli(torch.full((batch_size, num_boxes, 1), 0.10, device=device)).bool().expand(-1, -1, 6) & mask.unsqueeze(-1)
@@ -242,13 +274,17 @@ class KPLTask(nn.Module):
         Returns:
             torch.Tensor: Índices das regiões na grade.
         """
-        grid_step = max(1, img_size // self.grid_size)  
-        indices = (keypoints // grid_step).long()  # Mapeia as coordenadas para células da grade
+        if isinstance(img_size, torch.Tensor) and img_size.numel() > 1:
+            img_size = img_size.max(dim=-1).values  # Pega o maior valor entre altura e largura por batch
+
+        grid_step = torch.tensor(img_size // self.grid_size, dtype=torch.long, device=keypoints.device)
+        grid_step = torch.clamp(grid_step, min=1)
+        indices = (keypoints // grid_step.unsqueeze(-1).unsqueeze(-1)).long()
 
         indices[..., 0] = indices[..., 0].clamp(0, self.grid_size - 1)
         indices[..., 1] = indices[..., 1].clamp(0, self.grid_size - 1)
 
-        return indices[..., 0] * self.grid_size + indices[..., 1] 
+        return indices[..., 0] * self.grid_size + indices[..., 1]
 
     def forward(self, bounding_boxes, img_size, attention_mask, input_ids):
         _, labels = self.mask_bounding_boxes(bounding_boxes)
@@ -262,12 +298,17 @@ class KPLTask(nn.Module):
         self.classifier.to(device)  # Move `self.classifier` para `device`
         logits = self.classifier(outputs.to(device))  # (B, T, num_classes * 3)
 
+        if labels.shape[-1] == 4:
+            x_tl, y_tl, w, h = labels[..., 0], labels[..., 1], labels[..., 2], labels[..., 3]
+            x_br = x_tl + w
+            y_br = y_tl + h
+            x_c = x_tl + w / 2
+            y_c = y_tl + h / 2
+
+            labels = torch.stack([x_tl, y_tl, x_br, y_br, x_c, y_c], dim=-1)
         # Reformatar os labels dos key points
         keypoints = labels[:, :, [0, 1, 2, 3, 4, 5]].reshape(labels.shape[0], labels.shape[1], 3, 2)
         target_labels = self.quantize_to_grid(keypoints, img_size)
-
-        if (target_labels < 0).any() or (target_labels >= self.num_classes).any():
-            print(f"[ERRO] target_labels contém valores fora do intervalo esperado: {target_labels}")
 
         target_labels = target_labels.clamp(0, self.num_classes - 1)
 
@@ -275,33 +316,47 @@ class KPLTask(nn.Module):
 
         return logits, loss
 
-    def train_task(self, dataloader, num_epochs, output_dir, img_size):
+    def train_task(self, dataloader, num_epochs, output_dir):
         """
-        Treina a tarefa KPL e salva o estado do modelo.
+        Treina a task KPL (Key Point Location).
 
         Args:
-            dataloader: DataLoader contendo os bounding boxes e dados de entrada.
-            num_epochs: Número de épocas para treinamento.
-            output_dir: Diretório onde o modelo será salvo.
-            img_size: Dimensão da imagem usada para quantização.
+            dataloader: DataLoader contendo os bounding boxes e labels.
+            num_epochs: Número de épocas de treinamento.
+            output_dir: Diretório onde o modelo treinado será salvo.
         """
-        self.train()
+        device = next(self.model.parameters()).device
+        self.model.train()
+
         for epoch in range(num_epochs):
             total_loss = 0
+            print(len(dataloader))
+            i = 0
             for batch in dataloader:
-                bounding_boxes = batch["bounding_boxes"].to(self.model.device)
+                i += 1
+                if i % 5 == 0: print(i)
+                bounding_boxes = batch["bbox"].to(device)  # (B, T, 6)
+                img_size = batch["img_size"].to(device)
+                attention_mask = batch["attention_mask"].to(device)
+                input_ids = batch["input_ids"].to(device)
 
                 self.optimizer.zero_grad()
-                loss = self.forward(bounding_boxes, img_size)  # Chama a função forward explicitamente
+                _, loss = self.forward(bounding_boxes, img_size, attention_mask, input_ids)
+
                 loss.backward()
                 self.optimizer.step()
 
                 total_loss += loss.item()
-            
+
             avg_loss = total_loss / len(dataloader)
-            print(f"Epoch {epoch+1}/{num_epochs}, Loss: {avg_loss:.4f}")
-        torch.save(self.state_dict(), f"{output_dir}/kpl_task.pth")
-        print("Treinamento concluído e modelo salvo!")
+            print(f"Época {epoch + 1}/{num_epochs} - Loss KPL: {avg_loss:.4f}")
+
+        # Salvar modelo treinado
+        os.makedirs(output_dir, exist_ok=True)
+        model_path = os.path.join(output_dir, "kpl_model.pth")
+        torch.save(self.model.state_dict(), model_path)
+        print(f"Modelo KPL salvo em {model_path}")
+
 
 class RPCTask(nn.Module): 
     def __init__(self, model, input_dim, hidden_dim, num_directions=8, num_distances=5, lr=1e-3):
